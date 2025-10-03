@@ -7,18 +7,22 @@ app.py — DS-only loader that matches mainapp.py's DS contract 1:1
 Behavior tied to .env:
 - GOOGLE_CREDENTIALS_BASE64: base64-encoded service account JSON (required)
 - GOOGLE_SHEET_ID: if set, export this Google Sheet to XLSX
-- else if GOOGLE_DRIVE_FOLDER_ID: pick the newest file in that folder
+- else if GOOGLE_DRIVE_FOLDER_ID: pick the newest **DS-matching** file in that folder
   - if Google Sheet → export to XLSX
   - else (xlsx/ods) → download file content
+- (optional) DS_FILENAME_REGEX: regex to match DS filenames (default below)
+- (optional) DS_SHEET_NAME: force a specific sheet/tab name (for XLSX)
+- (optional) DS_HEADER_ROW: zero-based header row (default "1" → Excel row 2)
 - MONGODB_URI, MONGODB_DB: Mongo target
 
 Process:
 1) Delete data/ds.xlsx and data/ds.ods
-2) Download/export DS to data/ds.xlsx (or .ods)
-3) Read with header row = 2 (header=1)
-4) Clean Excel artifacts in text (e.g., _x0009_, non-breaking/zero-width spaces)
-5) Build DS docs (exact same fields/rules as mainapp.py)
-6) Upsert to Mongo + ensure ds indexes
+2) Download/export DS to data/ds.xlsx (or .ods), **DS-only**
+3) Preview first 5 raw rows (no header) so you can confirm header placement
+4) Read with header row = 2 (header=1) unless overridden
+5) Clean Excel artifacts in text (e.g., _x0009_, non-breaking/zero-width spaces)
+6) Build DS docs (exact same fields/rules as mainapp.py)
+7) Upsert to Mongo + ensure ds indexes
 """
 
 import os, sys, io, re, json, base64, hashlib
@@ -43,7 +47,7 @@ if sys.getdefaultencoding().lower() != "utf-8":
 # ---------- Constants ----------
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 ALLOWED_XLSX = (".xlsx", ".xls")
-ALLOWED_ODS = (".ods",)
+ALLOWED_ODS  = (".ods",)
 
 HEADERS_MAP_DS = {
     "Date DS":"date_ds",
@@ -68,10 +72,10 @@ DS_LINE_FIELDS = [
 _ALNUM = re.compile(r"[^0-9A-Za-z]")
 _EXCEL_EPOCH = datetime(1899, 12, 30)
 
+# Default DS filename matcher (tunable via .env: DS_FILENAME_REGEX)
+DS_FILENAME_REGEX_DEFAULT = r"(?i)\b(DS|Devis[ _-]?Service|Bon[ _-]?de[ _-]?Réparation)\b"
+
 # ---------- Text cleaning ----------
-# - Decode Excel's XML-style escapes: _x0009_, _x000A_, _x000D_, etc.
-# - Strip weird spaces: NBSP (\u00A0), NNBSP (\u202F), zero-width (\u200B-\u200D)
-# - Collapse whitespace to single spaces
 _excel_escape_re = re.compile(r"_x([0-9A-Fa-f]{4})_")
 
 def _decode_excel_escapes(s: str) -> str:
@@ -89,7 +93,7 @@ def clean_text(v: Any) -> Any:
     s = _decode_excel_escapes(v)
     # Replace tabs/newlines and non-breaking/zero-width spaces with normal space
     s = re.sub(r"[\t\r\n\u00A0\u202F\u2007\u200B\u200C\u200D]+", " ", s)
-    # Sometimes exporters double-escape: handle literal strings like '\t' or '\n'
+    # Handle literal strings like '\t', '\n', '\r'
     s = s.replace("\\t", " ").replace("\\n", " ").replace("\\r", " ")
     # Collapse multiple spaces
     s = re.sub(r"\s+", " ", s)
@@ -178,13 +182,41 @@ def read_first_sheet_ods_with_header(path: str, header_row: int = 1) -> pd.DataF
         return pd.DataFrame(cols)
     return pd.DataFrame()
 
-def read_table(path: str, header_row: int = 1) -> pd.DataFrame:
+def read_table(path: str, header_row: int = 1, sheet_name: Optional[str] = None) -> pd.DataFrame:
     ext = os.path.splitext(path.lower())[1]
     if ext == ".ods":
         return read_first_sheet_ods_with_header(path, header_row=header_row)
     if ext in (".xlsx", ".xls"):
-        return pd.read_excel(path, header=header_row)
+        kw = dict(header=header_row, engine="openpyxl")
+        if sheet_name:
+            kw["sheet_name"] = sheet_name
+        return pd.read_excel(path, **kw)
     raise RuntimeError(f"Unsupported extension: {ext}")
+
+def preview_first_rows(path: str, sheet_name: Optional[str] = None, n: int = 5):
+    """Print first n rows raw (header=None) to confirm header placement."""
+    ext = os.path.splitext(path.lower())[1]
+    try:
+        if ext == ".ods":
+            from pyexcel_ods3 import get_data
+            book = get_data(path)
+            for sname, rows in book.items():
+                if sheet_name and sname != sheet_name:
+                    continue
+                print(f"[PREVIEW] {sname}:")
+                for i, r in enumerate(rows[:n]):
+                    print(f"Row {i}: {r}")
+                break
+        else:
+            kw = dict(header=None, nrows=n, engine="openpyxl")
+            if sheet_name:
+                kw["sheet_name"] = sheet_name
+            df = pd.read_excel(path, **kw)
+            print(f"[PREVIEW] First {n} rows (raw, no header) from sheet={sheet_name or 'FIRST'}:")
+            for i in range(min(n, len(df))):
+                print(f"Row {i}: {list(df.iloc[i].values)}")
+    except Exception as e:
+        print(f"[WARN] Preview failed: {e}")
 
 # ---------- Mongo ----------
 def get_client_db(uri: str, dbname: str):
@@ -205,7 +237,7 @@ def ensure_ds_indexes(db):
     for f in ("nds_ds","imm_norm","ww_norm","vehicle_id","lines_sig"):
         db.ds.create_index(f)
 
-# ---------- Google auth + Drive helpers ----------
+# ---------- Google auth + Drive helpers (DS-only picking) ----------
 def build_drive_service(creds_b64: str):
     """Create Drive service using base64 service-account JSON from .env."""
     data = base64.b64decode(creds_b64).decode("utf-8")
@@ -234,15 +266,31 @@ def download_file_content(drive, file_id: str, out_path: str):
             _, done = downloader.next_chunk()
     print(f"[DL] Downloaded file → {out_path}")
 
-def pick_latest_in_folder(drive, folder_id: str) -> Tuple[str, str, str]:
-    """Returns (file_id, name, mimeType) for the most recently modified file in folder."""
+def list_files_in_folder(drive, folder_id: str) -> List[Dict[str, Any]]:
     q = f"'{folder_id}' in parents and trashed=false"
-    fields = "files(id,name,mimeType,modifiedTime)"
-    res = drive.files().list(q=q, fields=fields, orderBy="modifiedTime desc", pageSize=1).execute()
-    files = res.get("files", [])
+    fields = "nextPageToken, files(id,name,mimeType,modifiedTime)"
+    files, page_token = [], None
+    while True:
+        res = drive.files().list(q=q, fields=fields, orderBy="modifiedTime desc",
+                                 pageSize=1000, pageToken=page_token).execute()
+        files.extend(res.get("files", []))
+        page_token = res.get("nextPageToken")
+        if not page_token:
+            break
+    return files
+
+def pick_latest_ds_only(drive, folder_id: str, pattern: str) -> Tuple[str, str, str]:
+    """Return (file_id, name, mimeType) of newest file whose NAME matches DS regex."""
+    files = list_files_in_folder(drive, folder_id)
     if not files:
         raise RuntimeError("No files found in the folder.")
-    f = files[0]
+    ds_files = [f for f in files if re.search(pattern, f.get("name", ""))]
+    if not ds_files:
+        raise RuntimeError(
+            "No DS file matched DS_FILENAME_REGEX in the folder. "
+            "Rename your DS file to include 'DS' (or set DS_FILENAME_REGEX in .env)."
+        )
+    f = ds_files[0]  # already sorted by modifiedTime desc
     return f["id"], f["name"], f["mimeType"]
 
 # ---------- DS doc builder ----------
@@ -252,9 +300,8 @@ def build_ds_docs_from_dataframe(raw_ds: pd.DataFrame) -> List[Dict[str, Any]]:
         print("[WARN] ds: expected headers not found; present=", list(raw_ds.columns))
         return []
 
-    # Rename, then CLEAN all text columns, then normalize dates and plates
     df = raw_ds[present].rename(columns=HEADERS_MAP_DS).copy()
-    clean_object_columns_inplace(df)     # <<< remove _x0009_ etc.
+    clean_object_columns_inplace(df)
     normalize_dates_inplace_df(df)
     apply_norms_inplace_df(df)
 
@@ -312,6 +359,14 @@ def main():
     creds_b64 = os.getenv("GOOGLE_CREDENTIALS_BASE64")
     sheet_id  = os.getenv("GOOGLE_SHEET_ID", "").strip()
     folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
+    ds_sheet  = os.getenv("DS_SHEET_NAME", "").strip() or None
+    ds_header = os.getenv("DS_HEADER_ROW", "1").strip()
+    try:
+        header_row = int(ds_header)
+    except ValueError:
+        header_row = 1
+
+    ds_name_regex = os.getenv("DS_FILENAME_REGEX", DS_FILENAME_REGEX_DEFAULT)
 
     if not creds_b64:
         print("[ERROR] GOOGLE_CREDENTIALS_BASE64 is required in .env")
@@ -330,16 +385,17 @@ def main():
     # 2) Drive auth
     drive = build_drive_service(creds_b64)
 
-    # 3) Decide source and download/export
-    out_path = "data/ds.xlsx"  # prefer XLSX downstream; ODS also supported by the reader
+    # 3) Decide source and download/export (DS-only)
+    out_path = "data/ds.xlsx"  # default target
     if sheet_id:
         print(f"[SRC] Using GOOGLE_SHEET_ID={sheet_id} (export to XLSX)")
         export_google_sheet_to_xlsx(drive, sheet_id, out_path)
     elif folder_id:
-        print(f"[SRC] Using GOOGLE_DRIVE_FOLDER_ID={folder_id} (pick newest file)")
-        fid, name, mime = pick_latest_in_folder(drive, folder_id)
+        print(f"[SRC] Using GOOGLE_DRIVE_FOLDER_ID={folder_id} (DS-only; name regex)")
+        fid, name, mime = pick_latest_ds_only(drive, folder_id, ds_name_regex)
         print(f"[PICK] {name}  mime={mime}")
         if mime == "application/vnd.google-apps.spreadsheet":
+            out_path = "data/ds.xlsx"
             export_google_sheet_to_xlsx(drive, fid, out_path)
         else:
             _, ext = os.path.splitext(name.lower())
@@ -356,22 +412,24 @@ def main():
         print("[ERROR] Download/export failed or produced empty file.")
         sys.exit(3)
 
-    # 4) Read with headers on row 2 (header=1)
-    header_row = 1
+    # 4) Preview first rows to confirm header placement
+    preview_first_rows(out_path, sheet_name=ds_sheet, n=5)
+
+    # 5) Read with headers on row 2 (header=1) unless overridden
     try:
-        raw_ds = read_table(out_path, header_row=header_row)
+        raw_ds = read_table(out_path, header_row=header_row, sheet_name=ds_sheet)
     except Exception as e:
         print(f"[ERROR] failed reading {out_path}: {e}")
         sys.exit(4)
     print(f"[INFO] ds: read shape={raw_ds.shape}")
 
-    # 5) Build docs (exact contract) — includes text cleaning
+    # 6) Build docs (exact contract)
     ds_docs = build_ds_docs_from_dataframe(raw_ds)
     if not ds_docs:
         print("[INFO] ds: nothing to push (headers missing or no keys).")
         sys.exit(0)
 
-    # 6) Upsert to Mongo + indexes
+    # 7) Upsert to Mongo + indexes
     client, db = get_client_db(mongo_uri, mongo_db)
     try:
         ops = [
