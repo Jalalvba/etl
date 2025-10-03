@@ -49,3 +49,7 @@ __pypackages__/
 # OS
 .DS_Store
 Thumbs.db
+
+# Secrets
+.env
+etl-key.pem
