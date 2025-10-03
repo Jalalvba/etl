@@ -53,3 +53,8 @@ Thumbs.db
 # Secrets
 .env
 etl-key.pem
+etl-key.pem
+
+# Secrets
+.env
+*.pem
