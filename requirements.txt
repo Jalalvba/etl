@@ -1,0 +1,31 @@
+# Core
+pandas>=2.2.2
+numpy>=1.26.4
+python-dateutil>=2.9.0.post0
+
+# MongoDB
+pymongo>=4.8.0
+dnspython>=2.6.1
+
+# Env loader
+python-dotenv>=1.0.1
+
+# Google Drive / Sheets (read-only)
+google-api-python-client>=2.143.0
+google-auth>=2.35.0
+google-auth-httplib2>=0.2.0
+
+# Excel reader (XLSX only — no xlrd)
+openpyxl>=3.1.5
+
+# Optional (nice to have; used in your broader tooling)
+jsonschema>=4.23.0
+rich>=13.7.1
+tabulate>=0.9.0
+flask>=3.0.3
+jinja2>=3.1.4
+matplotlib>=3.9.2
+
+# Compression (optional, but your scripts reference them)
+zstandard>=0.23.0
+python-snappy>=0.7.3

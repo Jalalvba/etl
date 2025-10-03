@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.dll
+
+# Virtual environments
+.env/
+.venv/
+venv/
+ENV/
+
+# Local environment files & secrets
+*.env
+.env.local
+.env.*.local
+
+# Data & artifacts
+data/*.xlsx
+data/*.xls
+data/*.ods
+data/*.parquet
+data/*.csv
+data/*.json
+data/*.tmp
+data/tmp/
+tmp/
+*.log
+
+# Build / dist
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Caches
+.pytest_cache/
+.ipynb_checkpoints/
+.mypy_cache/
+__pypackages__/
+
+# Editors / IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
