@@ -13,9 +13,9 @@ venv/
 ENV/
 
 # Local environment files & secrets
-*.env
-.env.local
-.env.*.local
+.env
+*.pem
+etl-key.pem
 
 # Data & artifacts
 data/*.xlsx
@@ -49,12 +49,3 @@ __pypackages__/
 # OS
 .DS_Store
 Thumbs.db
-
-# Secrets
-.env
-etl-key.pem
-etl-key.pem
-
-# Secrets
-.env
-*.pem
