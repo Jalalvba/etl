@@ -2,868 +2,528 @@
 # -*- coding: utf-8 -*-
 
 """
-Drive → Mongo ETL for cp/parc/ds
-- Downloads latest CP / PARC / DS spreadsheets from a Drive folder
-- Normalizes/cleans text (fix _x0009_ etc → spaces), dates, and keys
-- Upserts into MongoDB collections: cp, parc, ds
-- Ensures indexes
+main.py — Unified XLSX loader for DS, CP, PARC (single-sheet, fuzzy keep+rename)
+
+Unified rule (applies to DS, CP, PARC):
+  • Fixed header row per dataset.
+  • Keep ONLY headers listed in that dataset's map (left = Excel label).
+  • Fuzzy-match headers (accents, spacing, small typos), then rename to canonical (right).
+  • Drop everything else.
+  • Accept if AT LEAST ONE mapped header matches; else error.
+  • Upsert to Mongo with change detection (doc_sig / lines_sig).
+
+Strict Drive pick:
+  • Name must match regex AND MIME is XLSX AND ".xlsx" extension.
+
+Header rows (0-based):
+  • DS   = 1  (Excel row 2)
+  • CP   = 7  (Excel row 8)
+  • PARC = 7  (Excel row 8)
+
+Env (required):
+  • GOOGLE_CREDENTIALS_BASE64
+  • GOOGLE_DRIVE_FOLDER_ID
+  • MONGODB_URI
+  • MONGODB_DB
+
+Env (optional):
+  • DS_FILENAME_REGEX, CP_FILENAME_REGEX, PARC_FILENAME_REGEX
 """
 
-import os, sys, io, re, time, argparse, math, hashlib, json, base64
+from __future__ import annotations
+
+import os, sys, io, re, json, base64, hashlib, warnings, unicodedata, difflib
+from dataclasses import dataclass
+from typing import Any, List, Dict, Tuple, Optional
 from datetime import datetime, date, timedelta, timezone as TZ
-from typing import Any, Optional, Iterable, List, Tuple, Dict, Set
-from contextlib import contextmanager
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
-from pymongo import MongoClient, UpdateOne
-from pymongo.errors import AutoReconnect, NetworkTimeout
-from pymongo.write_concern import WriteConcern
 from dotenv import load_dotenv
+from pymongo import MongoClient, UpdateOne
+from pymongo.write_concern import WriteConcern
 
 # Google APIs
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
+# ── Quiet the noise ───────────────────────────────────────────────────────────
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
+warnings.filterwarnings("ignore", category=FutureWarning, module="pandas")
 
-# =========================== UTF-8 console ===========================
-if sys.getdefaultencoding().lower() != "utf-8":
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
+# ── Constants ────────────────────────────────────────────────────────────────
+SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
+# File name regexes
+DS_FILENAME_REGEX_DEFAULT   = r"(?i)\b(DS|Devis[ _-]?Service|Bon[ _-]?de[ _-]?Réparation)\b"
+CP_FILENAME_REGEX_DEFAULT   = r"(?i)\b(CP|Car\s*Policy|Contrat\s*Parc)\b"
+PARC_FILENAME_REGEX_DEFAULT = r"(?i)\b(PARC|Fleet|Parc\s*Auto)\b"
 
-# =========================== Timing helper ===========================
-class StepTimer:
-    def __init__(self):
-        self.t0 = time.perf_counter()
-        self.steps: List[Tuple[str, float]] = []
+# Fixed header rows (0-based)
+DS_HEADER_ROW   = 1  # Excel row 2
+CP_HEADER_ROW   = 7  # Excel row 8
+PARC_HEADER_ROW = 7  # Excel row 8
 
-    @staticmethod
-    def _ts():
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    @contextmanager
-    def stage(self, name: str):
-        print(f"[{self._ts()}] [START] {name}")
-        t = time.perf_counter()
-        try:
-            yield
-        finally:
-            dt = time.perf_counter() - t
-            self.steps.append((name, dt))
-            print(f"[{self._ts()}] [END]   {name} — {dt:.2f}s")
-
-    def summary(self):
-        total = time.perf_counter() - self.t0
-        print("\n========== EXECUTION SUMMARY ==========")
-        for name, dt in self.steps:
-            print(f"  • {name:<35} {dt:>8.2f}s")
-        print("---------------------------------------")
-        print(f"  TOTAL                               {total:>8.2f}s")
-        print("=======================================\n")
-
-
-# =========================== Header maps ===========================
-HEADERS_MAP = {
-    "cp": {
-        "Client": "client_cp",
-        "Date début contrat": "date_debut_cp",
-        "Date fin contrat": "date_fin_cp",
-        "IMM": "imm",
-        "Marque": "marque",
-        "Modèle": "modele",
-        "Libellé version long": "modele_long",
-        "NUM chassis": "vin",
-        "WW": "ww",
-    },
-    "ds": {
-        "Date DS": "date_ds",
-        "Description": "description_ds",
-        "Désignation article": "designation_article_ds",
-        "Founisseur": "fournisseur_ds",
-        "Immatriculation": "imm",
-        "KM": "km_ds",
-        "N°DS": "nds_ds",
-        "Prix Unitaire ds": "prix_unitaire_ds_ds",
-        "Qté": "qte_ds",
-        "ENTITE": "entite_ds",
-        "Technicein": "technicien",
-        "Code art": "code_art",
-    },
-    "parc": {
-        "Immatriculation": "imm",
-        "Marque": "marque",
-        "Modèle": "modele",
-        "Numéro WW": "ww",
-        "N° de chassis": "vin",
-        "Etat véhicule": "etat_vehicule",
-        "Client": "client_parc",
-        "Locataire": "locataire_parc",
-        "Date MCE": "date_mce_parc",
-    },
+# Header maps: LEFT = exact Excel label, RIGHT = canonical name
+DS_HEADERS_MAP: Dict[str, str] = {
+    "Date DS": "date_ds",
+    "Description": "description_ds",
+    "Désignation article": "designation_article_ds",
+    "Founisseur": "fournisseur_ds",
+    "Immatriculation": "imm",
+    "KM": "km_ds",
+    "N°DS": "nds_ds",
+    "Prix Unitaire ds": "prix_unitaire_ds_ds",
+    "Qté": "qte_ds",
+    "ENTITE": "entite_ds",
+    "Technicein": "technicien",
+    "Code art": "code_art",
 }
 
+CP_HEADERS_MAP: Dict[str, str] = {
+    "Immatriculation": "imm",
+    "VIN": "vin",
+    "WW": "ww",
+    "Client": "client",
+    "Date début": "date_debut",
+    "Date fin": "date_fin",
+    # If your sheet says "Date début contrat" etc., fuzzy match will catch it.
+}
 
-# =========================== Helpers / normalization ===========================
+PARC_HEADERS_MAP: Dict[str, str] = {
+    "Immatriculation": "imm",
+    "VIN": "vin",
+    "WW": "ww",
+    "Modèle": "modele",
+    "Date MEC": "date_mec",
+    "Prestataire": "prestataire",
+    "Locataire": "locataire_parc",
+    "Etat véhicule": "etat_vehicule",
+}
+
+# DS downstream fields (after rename)
+DS_LINE_FIELDS = [
+    "date_ds","description_ds","designation_article_ds","fournisseur_ds","imm","km_ds",
+    "nds_ds","prix_unitaire_ds_ds","qte_ds","entite_ds","technicien","code_art","imm_norm","ww_norm"
+]
+
+# ── Small utils ───────────────────────────────────────────────────────────────
 _ALNUM = re.compile(r"[^0-9A-Za-z]")
 _EXCEL_EPOCH = datetime(1899, 12, 30)
 
-# Excel escapes like "_x0009_", "_x000D_", etc.
-_EXCEL_ESC = re.compile(r"_x([0-9A-Fa-f]{4})_")
-# Control characters (C0 set + DEL)
-_CTRL_WS = re.compile(r"[\u0000-\u001F\u007F]+")
-# Collapse multiple whitespace
-_MULTI_WS = re.compile(r"\s+")
-
-
-def _clean_text_like(s: str) -> str:
-    """
-    Decode Excel-style escapes to unicode (tabs/CR/LF→space), replace control chars with spaces,
-    normalize NBSP, collapse runs of whitespace, and trim.
-    """
-    if not s:
-        return ""
-
-    def repl(m: re.Match) -> str:
-        cp = int(m.group(1), 16)
-        return " " if cp < 0x20 else chr(cp)
-
-    # 1) Decode _xHHHH_
-    s = _EXCEL_ESC.sub(repl, s)
-    # 2) Normalize NBSP to normal spaces
-    s = s.replace("\u00A0", " ")
-    # 3) Control chars → space
-    s = _CTRL_WS.sub(" ", s)
-    # 4) Collapse and trim
-    s = _MULTI_WS.sub(" ", s).strip()
-    return s
-
-
 def _txt(x: Any) -> Optional[str]:
-    """Text canonicalizer used before writing to Mongo (applies the cleaner)."""
-    if x is None or (isinstance(x, float) and pd.isna(x)):
-        return None
-    s = _clean_text_like(str(x))
+    if x is None or (isinstance(x, float) and pd.isna(x)): return None
+    s = str(x).strip()
     return s or None
 
-
 def canon_plate(x: Any) -> Optional[str]:
-    if pd.isna(x):
-        return None
+    if pd.isna(x): return None
     return _ALNUM.sub("", str(x)).lower() or None
 
-
-def canon_vin(x: Any) -> Optional[str]:
-    if pd.isna(x):
-        return None
-    s = str(x).upper()
-    return _ALNUM.sub("", s).replace("I", "").replace("O", "").replace("Q", "") or None
-
-
-def _parse_any_to_date(v: Any) -> Optional[date]:
-    if pd.isna(v):
-        return None
+def _iso_date_from_any(v: Any) -> Optional[str]:
+    if pd.isna(v): return None
     if isinstance(v, date) and not isinstance(v, datetime):
-        return v
-    if isinstance(v, datetime):
-        return v.date()
-    if isinstance(v, (int, float)) and not pd.isna(v):
+        d = v
+    elif isinstance(v, datetime):
+        d = v.date()
+    elif isinstance(v, (int, float)) and not pd.isna(v):
         try:
             serial = int(v)
-            if serial > 0:
-                return (_EXCEL_EPOCH + timedelta(days=serial)).date()
+            d = (_EXCEL_EPOCH + timedelta(days=serial)).date() if serial > 0 else None
         except Exception:
-            pass
-    s = str(v).strip()
-    if not s:
-        return None
-    # numeric serial string
-    if re.fullmatch(r"\d{1,6}", s):
-        try:
-            serial = int(s)
-            if serial > 0:
-                return (_EXCEL_EPOCH + timedelta(days=serial)).date()
-        except Exception:
-            return None
-    # dd/mm/yyyy
-    m = re.match(r"^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})$", s)
-    if m:
-        dd, mm, yy = map(int, m.groups())
-        try:
-            return date(yy, mm, dd)
-        except ValueError:
-            return None
-    # yyyy-mm-dd
-    m = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$", s)
-    if m:
-        yy, mm, dd = map(int, m.groups())
-        try:
-            return date(yy, mm, dd)
-        except ValueError:
-            return None
-    d = pd.to_datetime(s, errors="coerce", dayfirst=True)
-    return d.date() if pd.notna(d) else None
+            d = None
+    else:
+        dts = pd.to_datetime(str(v).strip(), errors="coerce", dayfirst=True)
+        d = dts.date() if pd.notna(dts) else None
+    if not d or not (2000 <= d.year <= 2035): return None
+    return d.strftime("%Y-%m-%d")
 
-
-def _sanitize_range(d: Optional[date], min_year=2000, max_year=2035) -> Optional[date]:
-    if not d:
-        return None
-    return d if (min_year <= d.year <= max_year) else None
-
-
-def _iso(d: Optional[date]) -> Optional[str]:
-    return d.strftime("%Y-%m-%d") if d else None
-
-
-def json_sig(obj: Any) -> str:
-    payload = json.dumps(obj, separators=(",", ":"), ensure_ascii=False, sort_keys=True)
+def _sha256_json(obj: Any) -> str:
+    payload = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
+# ── Fuzzy header normalizer ──────────────────────────────────────────────────
+def _norm_label(s: str) -> str:
+    """Normalize a header: trim, lowercase, strip accents, drop punctuation, collapse spaces."""
+    if s is None:
+        return ""
+    s = " ".join(str(s).strip().split())  # collapse inner spaces
+    s = s.lower()
+    s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+    s = re.sub(r"[^0-9a-z ]+", "", s)  # keep alnum + space
+    s = " ".join(s.split())
+    return s
 
-def sanitize_object_columns_inplace(df: pd.DataFrame):
-    """Run _clean_text_like on all object columns (prevents artifacts early)."""
-    for col in df.select_dtypes(include=["object"]).columns:
-        df[col] = df[col].map(lambda v: _clean_text_like(v) if isinstance(v, str) else v)
+# ── Errors ───────────────────────────────────────────────────────────────────
+class ConfigError(RuntimeError): ...
+class DriveError(RuntimeError): ...
+class TransformError(RuntimeError): ...
+class UpsertError(RuntimeError): ...
 
+# ── Logging ──────────────────────────────────────────────────────────────────
+def log(msg: str) -> None:
+    ts = datetime.now(TZ.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+    print(f"[{ts}] {msg}")
 
-# =========================== Google auth + Drive helpers ===========================
-SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
-GSHEET_MIME = "application/vnd.google-apps.spreadsheet"
-XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+class Stepper:
+    def __init__(self) -> None: self.i = 0
+    def step(self, title: str) -> None:
+        self.i += 1
+        sep = "─" * max(8, 64 - len(title))
+        log(f"STEP {self.i}: {title} {sep}")
 
-def _b64_normalize(s: str) -> bytes:
-    """
-    Make GOOGLE_CREDENTIALS_BASE64 safe to decode:
-    - strip quotes
-    - remove whitespace/newlines
-    - pad '=' so len % 4 == 0
-    """
-    if not s:
-        return b""
-    s = (s or "").strip().strip('"')
-    s = re.sub(r"\s+", "", s)
-    s += "=" * ((4 - (len(s) % 4)) % 4)
-    return base64.b64decode(s)
+STEP = Stepper()
 
-def build_drive_service(creds_b64: str):
-    info = json.loads(_b64_normalize(creds_b64).decode("utf-8"))
-    creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
+# ── Config ───────────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class Config:
+    mongo_uri: str
+    mongo_db: str
+    creds_b64: str
+    drive_folder_id: str
+    ds_regex: str
+    cp_regex: str
+    parc_regex: str
 
+def load_config() -> Config:
+    STEP.step("Load configuration")
+    load_dotenv(override=False)
 
-def _atomic_write_request(req, out_path: str):
+    mongo_uri = os.getenv("MONGODB_URI")
+    mongo_db  = os.getenv("MONGODB_DB")
+    creds_b64 = os.getenv("GOOGLE_CREDENTIALS_BASE64")
+    folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
+    if not (mongo_uri and mongo_db and creds_b64 and folder_id):
+        raise ConfigError("Missing one of: MONGODB_URI, MONGODB_DB, GOOGLE_CREDENTIALS_BASE64, GOOGLE_DRIVE_FOLDER_ID")
+
+    ds_regex   = os.getenv("DS_FILENAME_REGEX",   DS_FILENAME_REGEX_DEFAULT)
+    cp_regex   = os.getenv("CP_FILENAME_REGEX",   CP_FILENAME_REGEX_DEFAULT)
+    parc_regex = os.getenv("PARC_FILENAME_REGEX", PARC_FILENAME_REGEX_DEFAULT)
+    log(f"Using DS regex: {ds_regex}")
+    log(f"Using CP regex: {cp_regex}")
+    log(f"Using PARC regex: {parc_regex}")
+
+    return Config(mongo_uri, mongo_db, creds_b64, folder_id, ds_regex, cp_regex, parc_regex)
+
+# ── Drive ────────────────────────────────────────────────────────────────────
+def make_drive(creds_b64: str):
+    STEP.step("Authenticate to Google Drive")
+    try:
+        info = json.loads(base64.b64decode(creds_b64).decode("utf-8"))
+        creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+        svc = build("drive", "v3", credentials=creds, cache_discovery=False)
+        log("Drive auth OK")
+        return svc
+    except Exception as e:
+        raise DriveError(f"Drive auth failed: {e}")
+
+def list_folder_files(drive, folder_id: str) -> List[Dict[str, Any]]:
+    q = f"'{folder_id}' in parents and trashed=false"
+    fields = "nextPageToken, files(id,name,mimeType,modifiedTime)"
+    files, page_token = [], None
+    while True:
+        res = drive.files().list(q=q, fields=fields, orderBy="modifiedTime desc",
+                                 pageSize=1000, pageToken=page_token).execute()
+        files.extend(res.get("files", []))
+        page_token = res.get("nextPageToken")
+        if not page_token:
+            break
+    log(f"Folder listing: {len(files)} files")
+    return files
+
+def _looks_like_xlsx(name: str, mime: str) -> bool:
+    return name.lower().endswith(".xlsx") and mime == XLSX_MIME
+
+def download_xlsx(drive, file_id: str, out_path: str) -> str:
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    req = drive.files().get_media(fileId=file_id)
     with open(out_path, "wb") as f:
         downloader = MediaIoBaseDownload(f, req)
         done = False
         while not done:
             _, done = downloader.next_chunk()
-
-
-def list_folder(drive, folder_id: str) -> List[Dict[str, str]]:
-    q = f"'{folder_id}' in parents and trashed=false"
-    res = (
-        drive.files()
-        .list(q=q, fields="files(id,name,mimeType,modifiedTime)", orderBy="modifiedTime desc", pageSize=1000)
-        .execute()
-    )
-    return res.get("files", [])
-
-
-def pick_by_basename(files: List[Dict[str, str]], base: str) -> Optional[Dict[str, str]]:
-    """Pick the most recent file whose name starts with base (case-insensitive). Prefer xlsx/Sheets."""
-    base = base.lower()
-    candidates = []
-    for f in files:
-        name = (f.get("name") or "").lower()
-        if name == base or name.startswith(base + ".") or name.startswith(base + " "):
-            candidates.append(f)
-    if not candidates:  # fallback: contains
-        for f in files:
-            name = (f.get("name") or "").lower()
-            if base in name:
-                candidates.append(f)
-    if not candidates:
-        return None
-
-    def score(f):
-        mt = f.get("mimeType", "")
-        if mt == XLSX_MIME:
-            return 0
-        if mt == GSHEET_MIME:
-            return 1
-        return 2
-
-    candidates.sort(key=score)
-    return candidates[0]
-
-
-def export_sheet_xlsx(drive, file_id: str, out_path_xlsx: str):
-    req = drive.files().export(fileId=file_id, mimeType=XLSX_MIME)
-    _atomic_write_request(req, out_path_xlsx)
-    print(f"[DL] Exported Google Sheet → {out_path_xlsx}")
-
-
-def ensure_xlsx_download(drive, file_meta: Dict[str, str], prefer_basename: str, out_dir: str) -> str:
-    """Guaranteed .xlsx output, regardless of source mime (Sheet/.xlsx/other → convert via export)."""
-    name = file_meta.get("name") or prefer_basename
-    mime = file_meta.get("mimeType", "")
-    fid = file_meta["id"]
-    out_path = os.path.join(out_dir, f"{prefer_basename}.xlsx")
-
-    if mime == GSHEET_MIME:
-        export_sheet_xlsx(drive, fid, out_path)
-        print(f"[OK] Saved {name} (Sheet) → {out_path}")
-        return out_path
-
-    if mime == XLSX_MIME or name.lower().endswith(".xlsx"):
-        req = drive.files().get_media(fileId=fid)
-        _atomic_write_request(req, out_path)
-        print(f"[DL] Downloaded XLSX → {out_path}")
-        return out_path
-
-    # Other format: convert by copying to Sheet then export .xlsx
-    copied = (
-        drive.files()
-        .copy(fileId=fid, body={"mimeType": GSHEET_MIME, "name": f"{prefer_basename}-autoconvert"})
-        .execute()
-    )
-    sheet_id = copied["id"]
-    try:
-        export_sheet_xlsx(drive, sheet_id, out_path)
-        print(f"[OK] Converted {name} → Sheet → {out_path}")
-    finally:
-        try:
-            drive.files().delete(fileId=sheet_id).execute()
-        except Exception:
-            pass
+    if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        raise DriveError("Downloaded XLSX is empty")
     return out_path
 
+def pick_and_fetch(drive, folder_id: str, name_regex: str,
+                   temp_name: str, final_name: str) -> Tuple[str, str, str]:
+    STEP.step(f"Find valid XLSX for {final_name}")
+    rx = re.compile(name_regex)
+    files = list_folder_files(drive, folder_id)
+    if not files:
+        raise DriveError("Folder is empty")
 
-# =========================== Readers (xlsx only) ===========================
-def read_cp_parc(path: str) -> pd.DataFrame:
-    return pd.read_excel(path, header=7, engine="openpyxl")  # row 8
+    for f in files:
+        fid  = f.get("id")
+        name = f.get("name", "")
+        mime = f.get("mimeType", "")
+        if not (rx.search(name) and _looks_like_xlsx(name, mime)):
+            continue
+        log(f"Candidate: {name} (mime ok)")
+        tmp = f"data/{temp_name}"
+        download_xlsx(drive, fid, tmp)
 
+        final_path = f"data/{final_name}"
+        try:
+            if os.path.exists(final_path):
+                os.remove(final_path)
+        except Exception:
+            pass
+        os.replace(tmp, final_path)
+        log(f"Accepted: {name}")
+        return fid, name, final_path
 
-def read_ds(path: str) -> pd.DataFrame:
-    return pd.read_excel(path, header=1, engine="openpyxl")  # row 2
+    raise DriveError("No XLSX matched regex + MIME + extension.")
 
+# ── Fuzzy keep+rename reader ─────────────────────────────────────────────────
+def read_keep_rename(path: str, header_row: int, header_map: Dict[str, str], label: str,
+                     fuzzy_threshold: float = 0.85) -> pd.DataFrame:
+    """
+    Read with headers at header_row, keep only keys in header_map (LEFT),
+    fuzzy-match (accents/spaces/small typos) to rename to canonical (RIGHT).
+    Accept if ≥1 mapped header matched; else error.
+    """
+    STEP.step(f"Read {label} (keep+rename, fuzzy headers)")
+    df = pd.read_excel(path, header=header_row, engine="openpyxl")
 
-# =========================== Mongo ===========================
-def get_client_db(uri: str, dbname: str):
-    client = MongoClient(
-        uri,
-        serverSelectionTimeoutMS=20000,
-        socketTimeoutMS=300000,
-        connectTimeoutMS=20000,
-        maxPoolSize=100,
-        compressors="zstd,snappy,zlib",
-        retryWrites=True,
-        appname="etl-upsert",
-    )
-    db = client.get_database(dbname, write_concern=WriteConcern(w=1))
-    return client, db
+    expected = list(header_map.keys())
+    norm_expected = {_norm_label(k): k for k in expected}
 
+    cols = list(df.columns)
+    norm_cols = {_norm_label(c): c for c in cols}
 
-# =========================== Bulk ===========================
-def _chunked(seq: list, n: int) -> Iterable[list]:
-    for i in range(0, len(seq), n):
-        yield seq[i : i + n]
+    # 1) exact normalized matches
+    matches: Dict[str, Tuple[str, float]] = {}  # canonical -> (original_col, score)
+    used_cols = set()
+    for ne, raw_expected in norm_expected.items():
+        if ne in norm_cols:
+            orig = norm_cols[ne]
+            canon = header_map[raw_expected]
+            matches[canon] = (orig, 1.0)
+            used_cols.add(orig)
 
+    # 2) fuzzy for remaining
+    remaining_norm_exp = [ne for ne, raw in norm_expected.items() if header_map[raw] not in matches]
+    remaining_cols = [c for c in cols if c not in used_cols]
+    norm_rem_cols = [(c, _norm_label(c)) for c in remaining_cols]
 
-def _do_bulk(coll, chunk, label, idx, total_batches, bypass):
-    t0 = time.perf_counter()
-    coll.bulk_write(chunk, ordered=False, bypass_document_validation=bypass)
-    dt = time.perf_counter() - t0
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    rate = len(chunk) / dt if dt > 0 else float("inf")
-    print(f"[{now}] [BULK] {label} batch {idx}/{total_batches} items={len(chunk)} dt={dt:.2f}s rate={rate:,.0f}/s")
-    return dt, len(chunk)
+    for ne in remaining_norm_exp:
+        raw_expected = norm_expected[ne]
+        canon = header_map[raw_expected]
+        best_score = -1.0
+        best_col = None
+        for orig, normed in norm_rem_cols:
+            score = difflib.SequenceMatcher(None, ne, normed).ratio()
+            if score > best_score:
+                best_score = score
+                best_col = orig
+        if best_col is not None and best_score >= fuzzy_threshold:
+            matches[canon] = (best_col, best_score)
+            used_cols.add(best_col)
 
+    if not matches:
+        raise TransformError(f"{label}: none of the expected headers found (even with fuzzy matching) at row {header_row}.")
 
-def bulk_exec(
-    coll, ops, batch_size=1000, label="ops", workers=4, max_retries=5, sleep_base=0.8, bypass=True
-):
-    if not ops:
-        return 0
-    batches = list(_chunked(ops, batch_size))
-    total_batches, total_items = len(batches), len(ops)
-    start, completed, total_dt = time.perf_counter(), 0, 0.0
+    for canon, (orig, score) in matches.items():
+        log(f"{label}: matched '{canon}' <- '{orig}' ({score:.2f})")
 
-    if workers <= 1:
-        for i, chunk in enumerate(batches, 1):
-            attempt = 0
-            while True:
-                try:
-                    dt, done = _do_bulk(coll, chunk, label, i, total_batches, bypass)
-                    completed += done
-                    total_dt += dt
-                    elapsed = time.perf_counter() - start
-                    avg = total_dt / max(i, 1)
-                    eta = elapsed + (total_batches - i) * avg
-                    print(f"        progress={completed:,}/{total_items:,} elapsed={elapsed:.1f}s ETA≈{eta:.1f}s")
-                    break
-                except (AutoReconnect, NetworkTimeout) as e:
-                    if attempt >= max_retries:
-                        print(f"[ERROR] {label} batch {i} failed: {e}")
-                        raise
-                    delay = sleep_base * (2 ** attempt)
-                    print(f"[RETRY] {label} batch {i} → sleep {delay:.1f}s ({e})")
-                    time.sleep(delay)
-                    attempt += 1
-        return total_items
+    keep_cols = [orig for (orig, _) in matches.values()]
+    rename_map = {orig: canon for canon, (orig, _) in matches.items()}
+    out = df[keep_cols].rename(columns=rename_map).copy()
+    log(f"{label}: kept -> {list(out.columns)}")
+    return out
 
-    i = 0
-    with ThreadPoolExecutor(max_workers=workers) as exe:
-        while i < total_batches:
-            window = []
-            for _ in range(min(workers, total_batches - i)):
-                idx = i + 1
-                window.append(exe.submit(_do_bulk, coll, batches[i], label, idx, total_batches, bypass))
-                i += 1
-            for fut in as_completed(window):
-                dt, done = fut.result()
-                completed += done
-                total_dt += dt
-                elapsed = time.perf_counter() - start
-                finished = math.ceil(completed / batch_size)
-                avg = total_dt / max(finished, 1)
-                eta = elapsed + max(total_batches - finished, 0) * avg
-                print(f"        progress={completed:,}/{total_items:,} elapsed={elapsed:.1f}s ETA≈{eta:.1f}s")
-    return total_items
-
-
-# =========================== Normalization ===========================
-DATE_TARGETS = {"cp": ["date_debut_cp", "date_fin_cp"], "parc": ["date_mce_parc"], "ds": ["date_ds"]}
-
-
-def normalize_dates_inplace(df: pd.DataFrame, tag: str):
-    for c in DATE_TARGETS.get(tag, []):
-        if c in df.columns:
-            df[c] = df[c].map(_parse_any_to_date).map(_sanitize_range).map(_iso)
-
-
-def apply_norms_inplace(df: pd.DataFrame):
+# ── DS doc building (fed by renamed columns) ─────────────────────────────────
+def normalize_ds_df(df: pd.DataFrame) -> pd.DataFrame:
+    if "date_ds" in df.columns:
+        df["date_ds"] = df["date_ds"].map(_iso_date_from_any)
     if "imm" in df.columns:
         df["imm_norm"] = df["imm"].map(canon_plate)
     if "ww" in df.columns:
         df["ww_norm"] = df["ww"].map(canon_plate)
-    if "vin" in df.columns:
-        df["vin_norm"] = df["vin"].map(canon_vin)
-
-
-# =========================== Index helpers ===========================
-def drop_indexes(db):
-    for coll in ("cp", "parc", "ds"):
-        try:
-            db[coll].drop_indexes()
-            print(f"[INFO] dropped indexes on {coll}")
-        except Exception as e:
-            print(f"[WARN] drop indexes {coll}: {e}")
-
-
-def ensure_indexes(db):
-    for f in ("imm_norm", "vin_norm", "ww_norm"):
-        db.cp.create_index(f)
-        db.parc.create_index(f)
-    for f in ("nds_ds", "imm_norm", "ww_norm", "vehicle_id", "lines_sig"):
-        db.ds.create_index(f)
-    db.cp.create_index("doc_sig")
-    db.parc.create_index("doc_sig")
-
-
-# =========================== Existing signatures ===========================
-def fetch_existing_sig_map(db, coll_name: str, ids: List[str], sig_field: str = "doc_sig"):
-    sig_map: Dict[str, Optional[str]] = {}
-    present_ids: Set[str] = set()
-    if not ids:
-        print(f"[INFO] {coll_name}: existing matches loaded = 0")
-        return sig_map, present_ids
-    CH = 5000
-    for i in range(0, len(ids), CH):
-        chunk = ids[i : i + CH]
-        cur = db[coll_name].find({"_id": {"$in": chunk}}, {"_id": 1, sig_field: 1})
-        for doc in cur:
-            _id = str(doc["_id"])
-            present_ids.add(_id)
-            sig_map[_id] = doc.get(sig_field)
-    print(f"[INFO] {coll_name}: existing matches loaded = {len(present_ids):,}")
-    return sig_map, present_ids
-
-
-# =========================== DS helpers ===========================
-DS_LINE_FIELDS = [
-    "date_ds",
-    "description_ds",
-    "designation_article_ds",
-    "fournisseur_ds",
-    "imm",
-    "km_ds",
-    "nds_ds",
-    "prix_unitaire_ds_ds",
-    "qte_ds",
-    "entite_ds",
-    "technicien",
-    "code_art",
-    "imm_norm",
-    "ww_norm",
-]
-
+    return df
 
 def canonicalize_lines(df_group: pd.DataFrame) -> List[Dict[str, Any]]:
-    rows = []
+    rows: List[Dict[str, Any]] = []
     for _, row in df_group.iterrows():
         rows.append({k: _txt(row.get(k)) if k in df_group.columns else None for k in DS_LINE_FIELDS})
-    rows.sort(
-        key=lambda r: (
-            r.get("code_art") or "",
-            r.get("designation_article_ds") or "",
-            r.get("qte_ds") or "",
-            r.get("prix_unitaire_ds_ds") or "",
-            r.get("description_ds") or "",
-            r.get("entite_ds") or "",
-            r.get("technicien") or "",
-        )
-    )
+    rows.sort(key=lambda r: (
+        r.get("code_art") or "",
+        r.get("designation_article_ds") or "",
+        r.get("qte_ds") or "",
+        r.get("prix_unitaire_ds_ds") or "",
+        r.get("description_ds") or "",
+        r.get("entite_ds") or "",
+        r.get("technicien") or "",
+    ))
     return rows
 
+def build_ds_docs(df_raw: pd.DataFrame) -> List[Dict[str, Any]]:
+    STEP.step("Build DS documents")
+    df = normalize_ds_df(df_raw.copy())
+    mask = df.apply(lambda r: bool(_txt(r.get("imm_norm")) or _txt(r.get("ww_norm"))), axis=1)
+    df = df[mask].copy()
+    if df.empty: return []
+    docs: List[Dict[str, Any]] = []
+    for ds_no, g in df.groupby("nds_ds", dropna=False, sort=False):
+        _id = _txt(ds_no)
+        if not _id: continue
+        lines = canonicalize_lines(g)
+        imm_norm = _txt(g.get("imm_norm").dropna().iloc[0]) if "imm_norm" in g and not g["imm_norm"].dropna().empty else None
+        ww_norm  = _txt(g.get("ww_norm").dropna().iloc[0])  if "ww_norm"  in g and not g["ww_norm"].dropna().empty  else None
+        vehicle_id = imm_norm or ww_norm
+        dt_series = pd.to_datetime(g.get("date_ds"), errors="coerce", utc=True).dropna()
+        date_event = dt_series.max() if not dt_series.empty else None
+        docs.append({
+            "_id": _id,
+            "ds_no": _id,
+            "vehicle_id": vehicle_id,
+            "imm_norm": imm_norm,
+            "ww_norm": ww_norm,
+            "date_event": date_event,
+            "lines": lines,
+            "lines_sig": _sha256_json(lines),
+        })
+    log(f"DS docs: {len(docs)}")
+    return docs
 
-def hash_lines(lines: List[Dict[str, Any]]) -> str:
-    payload = json.dumps(lines, separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-# =========================== Main ===========================
-def main():
-    ap = argparse.ArgumentParser(
-        description="Drive .xlsx → MongoDB (cp/parc/ds). Always re-download; no RL; no local DS reuse."
-    )
-    ap.add_argument("--data-dir", default="data")
-    ap.add_argument("--mongo-uri", default=None)
-    ap.add_argument("--mongo-db", default=None)
-    ap.add_argument("--cp-batch", type=int, default=1500)
-    ap.add_argument("--parc-batch", type=int, default=1500)
-    ap.add_argument("--ds-batch", type=int, default=3000)
-    ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--drop-indexes", action="store_true")
-    args = ap.parse_args()
-
-    timer = StepTimer()
-
-    # Config
-    with timer.stage("Load .env and resolve config"):
-        BASE = os.path.abspath(os.path.dirname(__file__))
-        load_dotenv(os.path.join(BASE, ".env"), override=False)
-        resolved_uri = args.mongo_uri or os.getenv("MONGODB_URI") or os.getenv("MONGO_URI") or "mongodb://localhost:27017"
-        resolved_db = args.mongo_db or os.getenv("MONGODB_DB") or os.getenv("MONGO_DB") or "avis_db"
-        creds_b64 = os.getenv("GOOGLE_CREDENTIALS_BASE64")
-        folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
-        if not creds_b64 or not folder_id:
-            print("[ERROR] GOOGLE_CREDENTIALS_BASE64 and GOOGLE_DRIVE_FOLDER_ID are required")
-            sys.exit(2)
-        print(f"[INFO] DB={resolved_db}; workers={args.workers}; drop_indexes={args.drop_indexes}")
-
-    # Erase local cp/parc/ds
-    with timer.stage("Erase local cp/parc/ds"):
-        os.makedirs(args.data_dir, exist_ok=True)
-        for fn in ("cp.xlsx", "parc.xlsx", "ds.xlsx"):
-            p = os.path.join(args.data_dir, fn)
-            try:
-                if os.path.exists(p):
-                    os.remove(p)
-                    print(f"[CLEAN] removed {p}")
-            except Exception as e:
-                print(f"[WARN] cannot remove {p}: {e}")
-
-    # Drive auth + download (cp/parc/ds)
-    with timer.stage("Download cp/parc/ds from Drive (mandatory)"):
-        drive = build_drive_service(creds_b64)
-        files = list_folder(drive, folder_id)
-
-        def fetch_and_save(base) -> str:
-            f = pick_by_basename(files, base)
-            if not f:
-                print(f"[ERROR] {base.upper()}: not found in Drive folder")
-                sys.exit(3)
-            print(
-                f"[PICK] {base.UPPER() if hasattr(base,'UPPER') else base.upper()}: "
-                f"{f.get('name')}  mime={f.get('mimeType')}  modified={f.get('modifiedTime')}"
-            )
-            out = ensure_xlsx_download(drive, f, base, args.data_dir)
-            print(f"[OK] Saved {f.get('name')} → {out}")
-            return out
-
-        cp_path = fetch_and_save("cp")
-        parc_path = fetch_and_save("parc")
-        ds_path = fetch_and_save("ds")
-
-    with timer.stage("Read + rename + normalize (cp/parc/ds)"):
-        dfs: Dict[str, pd.DataFrame] = {}
-
-        # CP
-        raw = read_cp_parc(cp_path)
-        present = [c for c in HEADERS_MAP["cp"] if c in raw.columns]
-        if not present:
-            print("[WARN] cp: expected headers not found")
-            dfs["cp"] = pd.DataFrame()
+# ── CP / PARC simple docs ────────────────────────────────────────────────────
+def build_row_docs(df: pd.DataFrame, pk_cols: List[str], label: str) -> List[Dict[str, Any]]:
+    STEP.step(f"Build {label} documents")
+    have_all_pks = all(c in df.columns for c in pk_cols)
+    docs: List[Dict[str, Any]] = []
+    for _, row in df.iterrows():
+        body = {k: (None if pd.isna(v) else v) for k, v in row.to_dict().items()}
+        if have_all_pks:
+            _id = "|".join(str(body.get(c) or "").strip() for c in pk_cols)
         else:
-            df = raw[present].rename(columns=HEADERS_MAP["cp"])
-            sanitize_object_columns_inplace(df)  # ← clean weird escapes first
-            normalize_dates_inplace(df, "cp")
-            apply_norms_inplace(df)
-            dfs["cp"] = df
-            print(f"[OK] cp rows={len(df):,}")
+            _id = _sha256_json(body)
+        doc = {**body, "_id": _id, "doc_sig": _sha256_json(body)}
+        docs.append(doc)
+    log(f"{label} docs: {len(docs)}")
+    return docs
 
-        # PARC
-        raw = read_cp_parc(parc_path)
-        present = [c for c in HEADERS_MAP["parc"] if c in raw.columns]
-        if not present:
-            print("[WARN] parc: expected headers not found")
-            dfs["parc"] = pd.DataFrame()
-        else:
-            df = raw[present].rename(columns=HEADERS_MAP["parc"])
-            sanitize_object_columns_inplace(df)  # ← clean weird escapes first
-            normalize_dates_inplace(df, "parc")
-            apply_norms_inplace(df)
-            dfs["parc"] = df
-            print(f"[OK] parc rows={len(df):,}")
-
-        # DS
-        raw = read_ds(ds_path)
-        present = [c for c in HEADERS_MAP["ds"] if c in raw.columns]
-        if not present:
-            print("[WARN] ds: expected headers not found")
-            dfs["ds"] = pd.DataFrame()
-        else:
-            df = raw[present].rename(columns=HEADERS_MAP["ds"])
-            sanitize_object_columns_inplace(df)  # ← clean weird escapes first
-            normalize_dates_inplace(df, "ds")
-            apply_norms_inplace(df)
-            dfs["ds"] = df
-            print(f"[OK] ds rows={len(df):,}")
-
-    # Connect Mongo
-    with timer.stage("Connect to MongoDB"):
-        client, db = get_client_db(resolved_uri, resolved_db)
-        print(f"[INFO] Connected (w=1)")
-
+# ── Mongo plumbing ───────────────────────────────────────────────────────────
+def get_client_db(uri: str, dbname: str):
+    STEP.step("Connect to MongoDB")
     try:
-        if args.drop_indexes:
-            with timer.stage("Drop indexes (pre-write)"):
-                drop_indexes(db)
+        client = MongoClient(
+            uri,
+            serverSelectionTimeoutMS=20000,
+            socketTimeoutMS=300000,
+            connectTimeoutMS=20000,
+            maxPoolSize=100,
+            compressors="zstd,snappy,zlib",
+            retryWrites=True,
+            appname="etl-upsert-main",
+        )
+        db = client.get_database(dbname, write_concern=WriteConcern(w=1))
+        client.admin.command("ping")
+        log("Mongo ping OK")
+        return client, db
+    except Exception as e:
+        raise UpsertError(f"Mongo connection failed: {e}")
 
-        now = datetime.now(TZ.utc)
+def ensure_indexes(db) -> None:
+    STEP.step("Ensure indexes")
+    try:
+        for f in ("nds_ds","imm_norm","ww_norm","vehicle_id","lines_sig"):
+            db.ds.create_index(f)
+        for f in ("doc_sig",):
+            db.cp.create_index(f)
+            db.parc.create_index(f)
+        log("Indexes ensured")
+    except Exception as e:
+        raise UpsertError(f"Creating indexes failed: {e}")
 
-        # Upsert PARC
-        with timer.stage("Upsert PARC"):
-            inserted = migrated = updated = skipped = 0
-            parc_df = dfs.get("parc", pd.DataFrame())
-            if parc_df.empty:
-                print("[INFO] parc: nothing to push")
-            else:
-                req = [
-                    "imm",
-                    "marque",
-                    "modele",
-                    "ww",
-                    "vin",
-                    "etat_vehicule",
-                    "client_parc",
-                    "locataire_parc",
-                    "date_mce_parc",
-                    "imm_norm",
-                    "vin_norm",
-                    "ww_norm",
-                ]
-                for c in req:
-                    if c not in parc_df.columns:
-                        parc_df[c] = pd.NA
+def _preload_sig(db, coll: str, ids: List[str], field: str) -> Dict[str, Optional[str]]:
+    if not ids: return {}
+    cur = db[coll].find({"_id": {"$in": ids}}, {"_id": 1, field: 1})
+    return {str(d["_id"]): d.get(field) for d in cur}
 
-                ids, keys = [], []
-                for _, r in parc_df.iterrows():
-                    vk = _txt(r.get("vin_norm")) or _txt(r.get("imm_norm")) or _txt(r.get("ww_norm"))
-                    keys.append(vk)
-                    if vk:
-                        ids.append(vk)
-                ids = list(dict.fromkeys([i for i in ids if i]))
+def upsert_with_sig(db, coll: str, docs: List[Dict[str, Any]], sig_field: str) -> Dict[str,int]:
+    STEP.step(f"Upsert {coll}")
+    if not docs:
+        log("No docs to upsert")
+        return {"inserted":0,"updated":0,"skipped":0}
+    sig_map = _preload_sig(db, coll, [d["_id"] for d in docs], sig_field)
+    now = datetime.now(TZ.utc)
+    ins=upd=skp=0
+    ops: List[UpdateOne] = []
+    for d in docs:
+        prev = sig_map.get(d["_id"], None)
+        if prev is None:
+            ins += 1
+        elif prev == d.get(sig_field):
+            skp += 1
+            continue
+        else:
+            upd += 1
+        ops.append(UpdateOne({"_id": d["_id"]}, {"$set": {**d, "updated_at": now}}, upsert=True))
+    if ops:
+        db[coll].bulk_write(ops, ordered=False, bypass_document_validation=True)
+    log(f"{coll} → inserted={ins} updated={upd} skipped={skp}")
+    return {"inserted":ins,"updated":upd,"skipped":skp}
 
-                sig_map, present = fetch_existing_sig_map(db, "parc", ids, sig_field="doc_sig")
-                ops: List[UpdateOne] = []
-                for i in range(len(parc_df)):
-                    _id = keys[i]
-                    if not _id:
-                        continue
-                    row = parc_df.iloc[i].to_dict()
-                    doc = {k: _txt(row.get(k)) for k in req}
-                    body = {**doc, "_id": _id}
-                    sig = json_sig(body)
-                    prev = sig_map.get(_id, None)
-                    exists = _id in present
-                    if not exists:
-                        ops.append(
-                            UpdateOne(
-                                {"_id": _id}, {"$set": {**body, "doc_sig": sig, "updated_at": now}}, upsert=True
-                            )
-                        )
-                        inserted += 1
-                    elif prev is None:
-                        ops.append(UpdateOne({"_id": _id}, {"$set": {**body, "doc_sig": sig, "updated_at": now}}))
-                        migrated += 1
-                    elif prev != sig:
-                        ops.append(UpdateOne({"_id": _id}, {"$set": {**body, "doc_sig": sig, "updated_at": now}}))
-                        updated += 1
-                    else:
-                        skipped += 1
-                if ops:
-                    bulk_exec(db.parc, ops, batch_size=args.parc_batch, label="parc", workers=args.workers, bypass=True)
-                print(f"[OK] parc inserted={inserted:,} migrated={migrated:,} updated={updated:,} skipped={skipped:,}")
+# ── Orchestration ────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class RunCfg:
+    mongo_uri: str; mongo_db: str; creds_b64: str; drive_folder_id: str
+    ds_regex: str; cp_regex: str; parc_regex: str
 
-        # Upsert CP
-        with timer.stage("Upsert CP"):
-            inserted = migrated = updated = skipped = 0
-            cp_df = dfs.get("cp", pd.DataFrame())
-            if cp_df.empty:
-                print("[INFO] cp: nothing to push")
-            else:
-                req = [
-                    "client_cp",
-                    "date_debut_cp",
-                    "date_fin_cp",
-                    "imm",
-                    "marque",
-                    "modele",
-                    "modele_long",
-                    "vin",
-                    "ww",
-                    "imm_norm",
-                    "vin_norm",
-                    "ww_norm",
-                ]
-                for c in req:
-                    if c not in cp_df.columns:
-                        cp_df[c] = pd.NA
+def run(cfg: RunCfg) -> None:
+    log("BEGIN main load (DS/CP/PARC)")
+    drive = make_drive(cfg.creds_b64)
 
-                ids, keys = [], []
-                for _, r in cp_df.iterrows():
-                    vk = _txt(r.get("vin_norm")) or _txt(r.get("imm_norm")) or _txt(r.get("ww_norm"))
-                    keys.append(vk)
-                    if vk:
-                        ids.append(vk)
-                ids = list(dict.fromkeys([i for i in ids if i]))
+    # DS
+    _, ds_name, ds_path = pick_and_fetch(drive, cfg.drive_folder_id, cfg.ds_regex,
+                                         temp_name=".tmp_ds.xlsx",   final_name="ds.xlsx")
+    log(f"DS   → {ds_name}")
+    df_ds = read_keep_rename(ds_path, DS_HEADER_ROW, DS_HEADERS_MAP, "DS")
+    ds_docs = build_ds_docs(df_ds)
 
-                sig_map, present = fetch_existing_sig_map(db, "cp", ids, sig_field="doc_sig")
-                ops: List[UpdateOne] = []
-                for i in range(len(cp_df)):
-                    _id = keys[i]
-                    if not _id:
-                        continue
-                    row = cp_df.iloc[i].to_dict()
-                    doc = {k: _txt(row.get(k)) for k in req}
-                    body = {**doc, "_id": _id}
-                    sig = json_sig(body)
-                    prev = sig_map.get(_id, None)
-                    exists = _id in present
-                    if not exists:
-                        ops.append(
-                            UpdateOne(
-                                {"_id": _id}, {"$set": {**body, "doc_sig": sig, "updated_at": now}}, upsert=True
-                            )
-                        )
-                        inserted += 1
-                    elif prev is None:
-                        ops.append(UpdateOne({"_id": _id}, {"$set": {**body, "doc_sig": sig, "updated_at": now}}))
-                        migrated += 1
-                    elif prev != sig:
-                        ops.append(UpdateOne({"_id": _id}, {"$set": {**body, "doc_sig": sig, "updated_at": now}}))
-                        updated += 1
-                    else:
-                        skipped += 1
-                if ops:
-                    bulk_exec(db.cp, ops, batch_size=args.cp_batch, label="cp", workers=args.workers, bypass=True)
-                print(f"[OK] cp inserted={inserted:,} migrated={migrated:,} updated={updated:,} skipped={skipped:,}")
+    # CP
+    _, cp_name, cp_path = pick_and_fetch(drive, cfg.drive_folder_id, cfg.cp_regex,
+                                         temp_name=".tmp_cp.xlsx",   final_name="cp.xlsx")
+    log(f"CP   → {cp_name}")
+    df_cp = read_keep_rename(cp_path, CP_HEADER_ROW, CP_HEADERS_MAP, "CP")
+    cp_docs = build_row_docs(df_cp, pk_cols=["client","imm"], label="CP")
 
-        # Upsert DS
-        with timer.stage("Upsert DS"):
-            ds_df = dfs.get("ds", pd.DataFrame())
-            inserted = migrated = updated = skipped = 0
-            latest_dt: Optional[datetime] = None
-            if ds_df.empty:
-                print("[INFO] ds: nothing to push")
-            else:
-                def has_key(row):
-                    return bool(_txt(row.get("imm_norm")) or _txt(row.get("ww_norm")))
+    # PARC
+    _, parc_name, parc_path = pick_and_fetch(drive, cfg.drive_folder_id, cfg.parc_regex,
+                                             temp_name=".tmp_parc.xlsx", final_name="parc.xlsx")
+    log(f"PARC → {parc_name}")
+    df_parc = read_keep_rename(parc_path, PARC_HEADER_ROW, PARC_HEADERS_MAP, "PARC")
+    parc_docs = build_row_docs(df_parc, pk_cols=["imm"], label="PARC")
 
-                mask = ds_df.apply(has_key, axis=1)
-                skipped_no_key = int((~mask).sum())
-                ds_df = ds_df[mask].copy()
-                if skipped_no_key:
-                    print(f"[INFO] ds: skipped rows without imm_norm/ww_norm = {skipped_no_key:,}")
-                if ds_df.empty:
-                    print("[INFO] ds: nothing to push after key filtering.")
-                else:
-                    file_ids = (
-                        ds_df["nds_ds"].dropna().map(lambda x: str(x).strip()).replace("", pd.NA).dropna().unique().tolist()
-                    )
-                    sig_map, present = fetch_existing_sig_map(db, "ds", file_ids, sig_field="lines_sig")
-                    ops: List[UpdateOne] = []
-                    for ds_no, g in ds_df.groupby("nds_ds", dropna=False, sort=False):
-                        _id = _txt(ds_no)
-                        if not _id:
-                            continue
-                        lines = canonicalize_lines(g)
-                        lines_sig = hash_lines(lines)
-                        imm_norm = (
-                            _txt(g["imm_norm"].dropna().iloc[0]) if "imm_norm" in g and not g["imm_norm"].dropna().empty else None
-                        )
-                        ww_norm = (
-                            _txt(g["ww_norm"].dropna().iloc[0]) if "ww_norm" in g and not g["ww_norm"].dropna().empty else None
-                        )
-                        vehicle_id = imm_norm or ww_norm
-                        dt_series = pd.to_datetime(g["date_ds"], errors="coerce", utc=True).dropna()
-                        date_event = dt_series.max() if not dt_series.empty else None
-                        if date_event is not None:
-                            latest_dt = date_event if latest_dt is None else max(latest_dt, date_event)
-                        body = {
-                            "_id": _id,
-                            "ds_no": _id,
-                            "vehicle_id": vehicle_id,
-                            "imm_norm": imm_norm,
-                            "ww_norm": ww_norm,
-                            "date_event": date_event,
-                            "lines": lines,
-                            "lines_sig": lines_sig,
-                        }
-                        prev = sig_map.get(_id, None)
-                        exists = _id in present
-                        if not exists:
-                            ops.append(UpdateOne({"_id": _id}, {"$set": {**body, "updated_at": now}}, upsert=True))
-                            inserted += 1
-                        elif prev is None:
-                            ops.append(UpdateOne({"_id": _id}, {"$set": {**body, "updated_at": now}}))
-                            migrated += 1
-                        elif prev != lines_sig:
-                            ops.append(UpdateOne({"_id": _id}, {"$set": {**body, "updated_at": now}}))
-                            updated += 1
-                        else:
-                            skipped += 1
-                    if ops:
-                        bulk_exec(db.ds, ops, batch_size=args.ds_batch, label="ds", workers=args.workers, bypass=True)
-                    print(f"[OK] ds inserted={inserted:,} migrated={migrated:,} updated={updated:,} skipped={skipped:,}")
-                    print(f"[DONE] latest DS date={latest_dt}")
-
-        with timer.stage("Ensure indexes (post-write)"):
-            ensure_indexes(db)
-
+    client, db = get_client_db(cfg.mongo_uri, cfg.mongo_db)
+    try:
+        ds_stats   = upsert_with_sig(db, "ds",   ds_docs,   sig_field="lines_sig")
+        cp_stats   = upsert_with_sig(db, "cp",   cp_docs,   sig_field="doc_sig")
+        parc_stats = upsert_with_sig(db, "parc", parc_docs, sig_field="doc_sig")
+        ensure_indexes(db)
     finally:
-        try:
-            client.close()
-            print("[INFO] Mongo client closed.")
-        except Exception:
-            pass
+        try: client.close()
+        except Exception: pass
 
-    timer.summary()
+    log(f"UPSERT DS   : {ds_stats}")
+    log(f"UPSERT CP   : {cp_stats}")
+    log(f"UPSERT PARC : {parc_stats}")
+    log("END main load")
 
-
+# ── Entrypoint ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    main()
+    if sys.getdefaultencoding().lower() != "utf-8":
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
+    try:
+        c = load_config()
+        run(RunCfg(c.mongo_uri, c.mongo_db, c.creds_b64, c.drive_folder_id, c.ds_regex, c.cp_regex, c.parc_regex))
+    except (ConfigError, DriveError, TransformError, UpsertError) as e:
+        log(f"ERROR: {e}")
+        sys.exit(2)
+    except Exception as e:
+        log(f"FATAL: {type(e).__name__}: {e}")
+        sys.exit(3)
