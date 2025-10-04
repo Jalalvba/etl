@@ -2,29 +2,27 @@
 # -*- coding: utf-8 -*-
 
 """
-app.py — DS-only loader, tuned for speed.
+app.py — DS-only loader that matches main.py's DS contract 1:1
 
-What it does
-------------
-1) Downloads/exports the latest DS file (by GOOGLE_SHEET_ID or from a Drive folder).
-2) Reads the DS sheet (header row configurable), cleans Excel artifacts:
-   - Decodes _x0009_ / _x000D_ / etc.
-   - Replaces control chars & NBSP with spaces
-   - Collapses whitespace
-3) Normalizes dates & keys, builds DS docs identical to main.py.
-4) Skips unchanged docs by comparing lines_sig before bulk write.
-5) Upserts only changed docs, ensures DS indexes.
+Behavior tied to .env:
+- GOOGLE_CREDENTIALS_BASE64: base64-encoded service account JSON (required)
+- GOOGLE_SHEET_ID: if set, export this Google Sheet to XLSX
+- else if GOOGLE_DRIVE_FOLDER_ID: pick the newest **DS-matching** file in that folder
+  - if Google Sheet → export to XLSX
+  - else (xlsx/ods) → download file content
+- (optional) DS_FILENAME_REGEX: regex to match DS filenames (default below)
+- (optional) DS_SHEET_NAME: force a specific sheet/tab name (for XLSX/ODS)
+- (optional) DS_HEADER_ROW: zero-based header row (default "1" → Excel row 2)
+- MONGODB_URI, MONGODB_DB: Mongo target
 
-.env expected
--------------
-GOOGLE_CREDENTIALS_BASE64=   (base64 of service account JSON)
-GOOGLE_SHEET_ID=             (optional; if set, exported to XLSX)
-GOOGLE_DRIVE_FOLDER_ID=      (fallback if no GOOGLE_SHEET_ID)
-DS_FILENAME_REGEX=           (optional; default matches DS/Devis Service/Bon de Réparation)
-DS_SHEET_NAME=               (optional tab name)
-DS_HEADER_ROW=               (0-based; default "1" → Excel row 2)
-MONGODB_URI=
-MONGODB_DB=
+Process:
+1) Delete data/ds.xlsx and data/ds.ods
+2) Download/export DS to data/ds.xlsx (or .ods), **DS-only**
+3) Preview first 5 raw rows (no header) so you can confirm header placement
+4) Read with header row = 2 (header=1) unless overridden
+5) Clean Excel artifacts in text (e.g., _x0009_, non-breaking/zero-width spaces)
+6) Build DS docs (exact same fields/rules as main.py)
+7) Upsert to Mongo + ensure ds indexes; skip unchanged via lines_sig
 """
 
 import os, sys, io, re, json, base64, hashlib
@@ -77,32 +75,39 @@ _EXCEL_EPOCH = datetime(1899, 12, 30)
 # Default DS filename matcher (tunable via .env: DS_FILENAME_REGEX)
 DS_FILENAME_REGEX_DEFAULT = r"(?i)\b(DS|Devis[ _-]?Service|Bon[ _-]?de[ _-]?Réparation)\b"
 
-# =========================== Text cleaning (like main.py) ===========================
-_EXCEL_ESC = re.compile(r"_x([0-9A-Fa-f]{4})_")
-_CTRL_WS   = re.compile(r"[\u0000-\u001F\u007F]+")
-_MULTI_WS  = re.compile(r"\s+")
+# ---------- Text cleaning ----------
+_excel_escape_re = re.compile(r"_x([0-9A-Fa-f]{4})_")
 
-def _clean_text_like(s: str) -> str:
-    """Decode Excel-style escapes, normalize NBSP, drop control chars, collapse whitespace."""
-    if not s:
-        return ""
-    def repl(m: re.Match) -> str:
-        cp = int(m.group(1), 16)
-        return " " if cp < 0x20 else chr(cp)
-    s = _EXCEL_ESC.sub(repl, s)
-    s = s.replace("\u00A0", " ")
-    s = _CTRL_WS.sub(" ", s)
-    s = _MULTI_WS.sub(" ", s).strip()
-    return s
+def _decode_excel_escapes(s: str) -> str:
+    def sub(m):
+        try:
+            cp = int(m.group(1), 16)
+            return chr(cp)
+        except Exception:
+            return m.group(0)
+    return _excel_escape_re.sub(sub, s)
+
+def clean_text(v: Any) -> Any:
+    if not isinstance(v, str):
+        return v
+    s = _decode_excel_escapes(v)
+    # Replace tabs/newlines and non-breaking/zero-width spaces with normal space
+    s = re.sub(r"[\t\r\n\u00A0\u202F\u2007\u200B\u200C\u200D]+", " ", s)
+    # Handle literal strings like '\t', '\n', '\r'
+    s = s.replace("\\t", " ").replace("\\n", " ").replace("\\r", " ")
+    # Collapse multiple spaces
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
 
 def clean_object_columns_inplace(df: pd.DataFrame) -> None:
-    for col in df.select_dtypes(include=["object"]).columns:
-        df[col] = df[col].map(lambda v: _clean_text_like(v) if isinstance(v, str) else v)
+    for col in df.columns:
+        if df[col].dtype == object:
+            df[col] = df[col].map(clean_text)
 
-# =========================== Helpers ===========================
+# ---------- Helpers ----------
 def _txt(x: Any) -> Optional[str]:
     if x is None or (isinstance(x, float) and pd.isna(x)): return None
-    s = _clean_text_like(str(x))
+    s = str(x).strip()
     return s or None
 
 def canon_plate(x: Any) -> Optional[str]:
@@ -121,7 +126,6 @@ def _parse_any_to_date(v: Any) -> Optional[date]:
             pass
     s = str(v).strip()
     if not s: return None
-    # broad parse with dayfirst
     d = pd.to_datetime(s, errors="coerce", dayfirst=True)
     return d.date() if pd.notna(d) else None
 
@@ -159,7 +163,7 @@ def hash_lines(lines: List[Dict[str, Any]]) -> str:
     payload = json.dumps(lines, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-# ---------- ODS reader (header row aware) ----------
+# ---------- ODS/XLS reader (header row aware) ----------
 def read_first_sheet_ods_with_header(path: str, header_row: int = 1) -> pd.DataFrame:
     from pyexcel_ods3 import get_data
     book = get_data(path)
@@ -214,7 +218,7 @@ def preview_first_rows(path: str, sheet_name: Optional[str] = None, n: int = 5):
     except Exception as e:
         print(f"[WARN] Preview failed: {e}")
 
-# =========================== Mongo ===========================
+# ---------- Mongo ----------
 def get_client_db(uri: str, dbname: str):
     client = MongoClient(
         uri,
@@ -233,14 +237,22 @@ def ensure_ds_indexes(db):
     for f in ("nds_ds","imm_norm","ww_norm","vehicle_id","lines_sig"):
         db.ds.create_index(f)
 
-# =========================== Google auth + Drive helpers ===========================
+# ---------- Base64 normalizer ----------
 def _b64_normalize(s: str) -> bytes:
-    """Trim whitespace/newlines, fix padding, return decoded bytes."""
-    s = (s or "").strip()
+    """
+    Make GOOGLE_CREDENTIALS_BASE64 safe to decode:
+    - strip quotes
+    - remove whitespace/newlines
+    - pad '=' so len % 4 == 0
+    """
+    if not s:
+        return b""
+    s = (s or "").strip().strip('"')
     s = re.sub(r"\s+", "", s)
-    s += "=" * ((-len(s)) % 4)
+    s += "=" * ((4 - (len(s) % 4)) % 4)
     return base64.b64decode(s)
 
+# ---------- Google auth + Drive helpers (DS-only picking) ----------
 def build_drive_service(creds_b64: str):
     """Create Drive service using base64 service-account JSON from .env."""
     info = json.loads(_b64_normalize(creds_b64).decode("utf-8"))
@@ -295,7 +307,7 @@ def pick_latest_ds_only(drive, folder_id: str, pattern: str) -> Tuple[str, str, 
     f = ds_files[0]  # already sorted by modifiedTime desc
     return f["id"], f["name"], f["mimeType"]
 
-# =========================== DS builders ===========================
+# ---------- DS doc builder ----------
 def build_ds_docs_from_dataframe(raw_ds: pd.DataFrame) -> List[Dict[str, Any]]:
     present = [c for c in HEADERS_MAP_DS if c in raw_ds.columns]
     if not present:
@@ -352,24 +364,24 @@ def build_ds_docs_from_dataframe(raw_ds: pd.DataFrame) -> List[Dict[str, Any]]:
         print(f"[DONE] latest DS date={latest_dt}")
     return docs
 
-def fetch_existing_sig_map(db, ids: List[str]) -> Dict[str, Optional[str]]:
-    """Return {_id: lines_sig or None} for present ids."""
+def fetch_existing_lines_sig(db, ids: List[str]) -> Tuple[Dict[str, Optional[str]], set]:
     sig_map: Dict[str, Optional[str]] = {}
+    present = set()
     if not ids:
         print("[INFO] ds: existing matches loaded = 0")
-        return sig_map
+        return sig_map, present
     CH = 5000
-    present = 0
     for i in range(0, len(ids), CH):
         chunk = ids[i:i+CH]
         cur = db.ds.find({"_id": {"$in": chunk}}, {"_id": 1, "lines_sig": 1})
         for doc in cur:
-            sig_map[str(doc["_id"])] = doc.get("lines_sig")
-            present += 1
-    print(f"[INFO] ds: existing matches loaded = {present:,}")
-    return sig_map
+            _id = str(doc["_id"])
+            present.add(_id)
+            sig_map[_id] = doc.get("lines_sig")
+    print(f"[INFO] ds: existing matches loaded = {len(present):,}")
+    return sig_map, present
 
-# =========================== Main ===========================
+# ---------- Main ----------
 def main():
     load_dotenv(override=False)
 
@@ -448,40 +460,41 @@ def main():
         print("[INFO] ds: nothing to push (headers missing or no keys).")
         sys.exit(0)
 
-    # 7) Upsert to Mongo (skip unchanged) + indexes
+    # 7) Upsert to Mongo + indexes (skip unchanged)
     client, db = get_client_db(mongo_uri, mongo_db)
     try:
-        ids = [d["_id"] for d in ds_docs if d.get("_id")]
-        sig_map = fetch_existing_sig_map(db, ids)
+        ids = [d["_id"] for d in ds_docs]
+        sig_map, present = fetch_existing_lines_sig(db, ids)
+
         inserted = migrated = updated = skipped = 0
         ops: List[UpdateOne] = []
-
         now = datetime.now(TZ.utc)
 
         for d in ds_docs:
             _id = d["_id"]
             prev = sig_map.get(_id, None)
-            lines_sig = d.get("lines_sig")
-            exists = _id in sig_map
+            exists = _id in present
             if not exists:
-                ops.append(UpdateOne({"_id": _id}, {"$set": {**d, "updated_at": now}}, upsert=True)); inserted += 1
+                ops.append(UpdateOne({"_id": _id}, {"$set": {**d, "updated_at": now}}, upsert=True))
+                inserted += 1
             elif prev is None:
-                ops.append(UpdateOne({"_id": _id}, {"$set": {**d, "updated_at": now}})); migrated += 1
-            elif prev != lines_sig:
-                ops.append(UpdateOne({"_id": _id}, {"$set": {**d, "updated_at": now}})); updated += 1
+                ops.append(UpdateOne({"_id": _id}, {"$set": {**d, "updated_at": now}}))
+                migrated += 1
+            elif prev != d["lines_sig"]:
+                ops.append(UpdateOne({"_id": _id}, {"$set": {**d, "updated_at": now}}))
+                updated += 1
             else:
                 skipped += 1
 
-        if not ops:
-            print(f"[OK] ds inserted={inserted:,} migrated={migrated:,} updated={updated:,} skipped={skipped:,}")
+        if ops:
+            db.ds.bulk_write(ops, ordered=False, bypass_document_validation=True)
+            print(f"[OK] ds upserted; bulk write executed. n_ops={len(ops)}")
+        else:
             print("[FAST] No DS changes detected — nothing to write.")
-            ensure_ds_indexes(db)
-            return
-
-        db.ds.bulk_write(ops, ordered=False, bypass_document_validation=True)
-        print(f"[OK] ds inserted={inserted:,} migrated={migrated:,} updated={updated:,} skipped={skipped:,}")
 
         ensure_ds_indexes(db)
+        print(f"[OK] ds inserted={inserted:,} migrated={migrated:,} updated={updated:,} skipped={skipped:,}")
+
     finally:
         try: client.close()
         except Exception: pass

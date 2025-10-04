@@ -233,12 +233,17 @@ GSHEET_MIME = "application/vnd.google-apps.spreadsheet"
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 def _b64_normalize(s: str) -> bytes:
-    """Be tolerant to quotes, whitespace and missing padding in .env Base64."""
-    s = (s or "").strip().strip('"').strip("'")
+    """
+    Make GOOGLE_CREDENTIALS_BASE64 safe to decode:
+    - strip quotes
+    - remove whitespace/newlines
+    - pad '=' so len % 4 == 0
+    """
+    if not s:
+        return b""
+    s = (s or "").strip().strip('"')
     s = re.sub(r"\s+", "", s)
-    pad = (-len(s)) % 4
-    if pad:
-        s += "=" * pad
+    s += "=" * ((4 - (len(s) % 4)) % 4)
     return base64.b64decode(s)
 
 def build_drive_service(creds_b64: str):
@@ -581,7 +586,10 @@ def main():
             if not f:
                 print(f"[ERROR] {base.upper()}: not found in Drive folder")
                 sys.exit(3)
-            print(f"[PICK] {base.upper()}: {f.get('name')}  mime={f.get('mimeType')}  modified={f.get('modifiedTime')}")
+            print(
+                f"[PICK] {base.UPPER() if hasattr(base,'UPPER') else base.upper()}: "
+                f"{f.get('name')}  mime={f.get('mimeType')}  modified={f.get('modifiedTime')}"
+            )
             out = ensure_xlsx_download(drive, f, base, args.data_dir)
             print(f"[OK] Saved {f.get('name')} → {out}")
             return out
