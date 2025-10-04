@@ -2,14 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-main.py — Unified XLSX loader for DS, CP, PARC (single-sheet, fuzzy keep+rename)
+main.py — DS, CP, PARC loader with STRICT header matching (accents/space/case/punct only)
 
-Unified rule (applies to DS, CP, PARC):
-  • Fixed header row per dataset.
-  • Keep ONLY headers listed in that dataset's map (left = Excel label).
-  • Fuzzy-match headers (accents, spacing, small typos), then rename to canonical (right).
+Rules per dataset:
+  • Fixed header row.
+  • Keep ONLY headers listed in the dataset map (LEFT = Excel label).
+  • Strict matching: we normalize labels (lowercase, strip accents, remove punctuation, collapse spaces)
+    and require exact equality of normalized strings.
+  • Rename kept columns to canonical names (RIGHT side of the map).
   • Drop everything else.
-  • Accept if AT LEAST ONE mapped header matches; else error.
+  • Accept if AT LEAST ONE mapped header matched; else error.
   • Upsert to Mongo with change detection (doc_sig / lines_sig).
 
 Strict Drive pick:
@@ -32,7 +34,7 @@ Env (optional):
 
 from __future__ import annotations
 
-import os, sys, io, re, json, base64, hashlib, warnings, unicodedata, difflib
+import os, sys, io, re, json, base64, hashlib, warnings, unicodedata
 from dataclasses import dataclass
 from typing import Any, List, Dict, Tuple, Optional
 from datetime import datetime, date, timedelta, timezone as TZ
@@ -65,7 +67,8 @@ DS_HEADER_ROW   = 1  # Excel row 2
 CP_HEADER_ROW   = 7  # Excel row 8
 PARC_HEADER_ROW = 7  # Excel row 8
 
-# Header maps: LEFT = exact Excel label, RIGHT = canonical name
+# Header maps: LEFT = Excel label (what you expect to see), RIGHT = canonical name
+# NOTE: If a column is actually labeled differently (e.g., "IMM"), add it as another LEFT key.
 DS_HEADERS_MAP: Dict[str, str] = {
     "Date DS": "date_ds",
     "Description": "description_ds",
@@ -82,24 +85,32 @@ DS_HEADERS_MAP: Dict[str, str] = {
 }
 
 CP_HEADERS_MAP: Dict[str, str] = {
-    "Immatriculation": "imm",
-    "VIN": "vin",
+    "IMM": "imm",
+    "NUM chassis": "vin",
     "WW": "ww",
     "Client": "client",
-    "Date début": "date_debut",
-    "Date fin": "date_fin",
-    # If your sheet says "Date début contrat" etc., fuzzy match will catch it.
+    "Date début contrat": "date_debut_cp",
+     "Libellé version long": "modele_long",
+    "Date fin contrat": "date_fin_cp",
+    # If your sheet truly uses different labels (e.g., "IMM", "NUM chassis",
+    # "Date début contrat", "Date fin contrat"), add them explicitly here:
+    # "IMM": "imm",
+    # "NUM chassis": "vin",
+    # "Date début contrat": "date_debut",
+    # "Date fin contrat": "date_fin",
 }
 
 PARC_HEADERS_MAP: Dict[str, str] = {
     "Immatriculation": "imm",
-    "VIN": "vin",
+    "N° de chassis": "vin",
     "WW": "ww",
     "Modèle": "modele",
-    "Date MEC": "date_mec",
-    "Prestataire": "prestataire",
+    "Date MCE": "date_mec",
     "Locataire": "locataire_parc",
     "Etat véhicule": "etat_vehicule",
+    # Add aliases here if your file uses them:
+    # "NUM chassis": "vin",
+    # "Date MCE": "date_mec",
 }
 
 # DS downstream fields (after rename)
@@ -143,12 +154,11 @@ def _sha256_json(obj: Any) -> str:
     payload = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-# ── Fuzzy header normalizer ──────────────────────────────────────────────────
 def _norm_label(s: str) -> str:
-    """Normalize a header: trim, lowercase, strip accents, drop punctuation, collapse spaces."""
+    """Strict normalization: lowercase, strip accents, remove punctuation, collapse spaces."""
     if s is None:
         return ""
-    s = " ".join(str(s).strip().split())  # collapse inner spaces
+    s = " ".join(str(s).strip().split())  # collapse internal spaces
     s = s.lower()
     s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
     s = re.sub(r"[^0-9a-z ]+", "", s)  # keep alnum + space
@@ -277,60 +287,49 @@ def pick_and_fetch(drive, folder_id: str, name_regex: str,
 
     raise DriveError("No XLSX matched regex + MIME + extension.")
 
-# ── Fuzzy keep+rename reader ─────────────────────────────────────────────────
-def read_keep_rename(path: str, header_row: int, header_map: Dict[str, str], label: str,
-                     fuzzy_threshold: float = 0.85) -> pd.DataFrame:
+# ── STRICT keep+rename reader ────────────────────────────────────────────────
+def read_keep_rename_strict(path: str, header_row: int, header_map: Dict[str, str], label: str) -> pd.DataFrame:
     """
-    Read with headers at header_row, keep only keys in header_map (LEFT),
-    fuzzy-match (accents/spaces/small typos) to rename to canonical (RIGHT).
-    Accept if ≥1 mapped header matched; else error.
+    Strict matching:
+      - normalize expected labels and file columns (lowercase, strip accents, remove punctuation, collapse spaces)
+      - match ONLY if normalized strings are identical
+      - rename to canonical names
+      - accept if ≥1 mapped header matched; else error
     """
-    STEP.step(f"Read {label} (keep+rename, fuzzy headers)")
+    STEP.step(f"Read {label} (keep+rename, STRICT headers)")
     df = pd.read_excel(path, header=header_row, engine="openpyxl")
 
-    expected = list(header_map.keys())
-    norm_expected = {_norm_label(k): k for k in expected}
+    # Build normalized lookup for expected headers
+    norm_expected_to_canonical: Dict[str, str] = {}
+    norm_expected_to_raw: Dict[str, str] = {}
+    for raw, canonical in header_map.items():
+        ne = _norm_label(raw)
+        norm_expected_to_canonical[ne] = canonical
+        norm_expected_to_raw[ne] = raw  # for logging
 
-    cols = list(df.columns)
-    norm_cols = {_norm_label(c): c for c in cols}
+    # Build normalized lookup for actual columns
+    norm_col_to_actual: Dict[str, str] = {}
+    for c in df.columns:
+        norm_col_to_actual[_norm_label(c)] = c
 
-    # 1) exact normalized matches
-    matches: Dict[str, Tuple[str, float]] = {}  # canonical -> (original_col, score)
-    used_cols = set()
-    for ne, raw_expected in norm_expected.items():
-        if ne in norm_cols:
-            orig = norm_cols[ne]
-            canon = header_map[raw_expected]
-            matches[canon] = (orig, 1.0)
-            used_cols.add(orig)
+    # Exact normalized match only
+    matched: Dict[str, Tuple[str, float]] = {}  # canonical -> (actual_col, score=1.0)
+    for ne, canonical in norm_expected_to_canonical.items():
+        if ne in norm_col_to_actual:
+            actual = norm_col_to_actual[ne]
+            matched[canonical] = (actual, 1.0)
 
-    # 2) fuzzy for remaining
-    remaining_norm_exp = [ne for ne, raw in norm_expected.items() if header_map[raw] not in matches]
-    remaining_cols = [c for c in cols if c not in used_cols]
-    norm_rem_cols = [(c, _norm_label(c)) for c in remaining_cols]
+    if not matched:
+        raise TransformError(f"{label}: none of the expected headers found (strict normalized match) at row {header_row}.")
 
-    for ne in remaining_norm_exp:
-        raw_expected = norm_expected[ne]
-        canon = header_map[raw_expected]
-        best_score = -1.0
-        best_col = None
-        for orig, normed in norm_rem_cols:
-            score = difflib.SequenceMatcher(None, ne, normed).ratio()
-            if score > best_score:
-                best_score = score
-                best_col = orig
-        if best_col is not None and best_score >= fuzzy_threshold:
-            matches[canon] = (best_col, best_score)
-            used_cols.add(best_col)
+    # Log matches
+    for canonical, (actual, _) in matched.items():
+        raw_expected = norm_expected_to_raw[_norm_label(actual)]
+        log(f"{label}: matched '{canonical}' <- '{actual}' (strict)")
 
-    if not matches:
-        raise TransformError(f"{label}: none of the expected headers found (even with fuzzy matching) at row {header_row}.")
-
-    for canon, (orig, score) in matches.items():
-        log(f"{label}: matched '{canon}' <- '{orig}' ({score:.2f})")
-
-    keep_cols = [orig for (orig, _) in matches.values()]
-    rename_map = {orig: canon for canon, (orig, _) in matches.items()}
+    # Keep + rename
+    keep_cols = [actual for (actual, _) in matched.values()]
+    rename_map = {actual: canonical for canonical, (actual, _) in matched.items()}
     out = df[keep_cols].rename(columns=rename_map).copy()
     log(f"{label}: kept -> {list(out.columns)}")
     return out
@@ -481,21 +480,21 @@ def run(cfg: RunCfg) -> None:
     _, ds_name, ds_path = pick_and_fetch(drive, cfg.drive_folder_id, cfg.ds_regex,
                                          temp_name=".tmp_ds.xlsx",   final_name="ds.xlsx")
     log(f"DS   → {ds_name}")
-    df_ds = read_keep_rename(ds_path, DS_HEADER_ROW, DS_HEADERS_MAP, "DS")
+    df_ds = read_keep_rename_strict(ds_path, DS_HEADER_ROW, DS_HEADERS_MAP, "DS")
     ds_docs = build_ds_docs(df_ds)
 
     # CP
     _, cp_name, cp_path = pick_and_fetch(drive, cfg.drive_folder_id, cfg.cp_regex,
                                          temp_name=".tmp_cp.xlsx",   final_name="cp.xlsx")
     log(f"CP   → {cp_name}")
-    df_cp = read_keep_rename(cp_path, CP_HEADER_ROW, CP_HEADERS_MAP, "CP")
+    df_cp = read_keep_rename_strict(cp_path, CP_HEADER_ROW, CP_HEADERS_MAP, "CP")
     cp_docs = build_row_docs(df_cp, pk_cols=["client","imm"], label="CP")
 
     # PARC
     _, parc_name, parc_path = pick_and_fetch(drive, cfg.drive_folder_id, cfg.parc_regex,
                                              temp_name=".tmp_parc.xlsx", final_name="parc.xlsx")
     log(f"PARC → {parc_name}")
-    df_parc = read_keep_rename(parc_path, PARC_HEADER_ROW, PARC_HEADERS_MAP, "PARC")
+    df_parc = read_keep_rename_strict(parc_path, PARC_HEADER_ROW, PARC_HEADERS_MAP, "PARC")
     parc_docs = build_row_docs(df_parc, pk_cols=["imm"], label="PARC")
 
     client, db = get_client_db(cfg.mongo_uri, cfg.mongo_db)

@@ -2,31 +2,35 @@
 # -*- coding: utf-8 -*-
 
 """
-appds.py — DS-only XLSX loader (keep+rename only mapped headers)
+appds.py — DS-only loader (STRICT headers; XLSX-only) matching main.py DS contract 1:1
 
-Logic (same as main.py unified rule):
-  • Strict Drive pick: regex + XLSX MIME + ".xlsx".
-  • Read with fixed header row (0-based, default 1 → Excel row 2).
-  • Keep ONLY headers in DS_HEADERS_MAP (left = Excel label); rename to canonical (right).
-  • Drop everything else.
-  • Accept if AT LEAST ONE mapped header exists; else error.
-  • Build DS docs (lines + lines_sig) and upsert to Mongo.
+Behavior (env):
+  • GOOGLE_CREDENTIALS_BASE64  (required, service account JSON base64)
+  • GOOGLE_DRIVE_FOLDER_ID     (required)
+  • MONGODB_URI                (required)
+  • MONGODB_DB                 (required)
+  • DS_FILENAME_REGEX          (optional; default matches DS terms)
 
-Required env:
-  • GOOGLE_CREDENTIALS_BASE64
-  • GOOGLE_DRIVE_FOLDER_ID
-  • MONGODB_URI
-  • MONGODB_DB
+Process:
+  1) Authenticate Drive (service account).
+  2) Find newest file in folder whose NAME matches DS regex AND MIME is XLSX AND endswith .xlsx.
+  3) Download to data/ds.xlsx.
+  4) Read Excel with headers at row 2 (0-based header=1), STRICT normalized match against DS_HEADERS_MAP.
+     - Keep ONLY mapped headers; rename to canonical; drop everything else.
+     - Error if none of the mapped headers is found.
+  5) Build DS docs (exact same structure/fields/signature as in main.py).
+  6) Upsert to Mongo (skip unchanged by lines_sig) + ensure ds indexes.
+  7) Log each step; suppress noisy warnings.
 
-Optional env:
-  • DS_FILENAME_REGEX   (default matches DS terms)
-  • DS_HEADER_ROW       (default "1" → Excel row 2)
+Strict header matching = only accents/case/spacing/punctuation may differ.
+If your sheet truly uses a different label, add it as another LEFT key in DS_HEADERS_MAP.
 """
 
 from __future__ import annotations
 
-import os, sys, io, re, json, base64, hashlib, warnings
-from typing import Any, List, Dict, Optional, Tuple
+import os, sys, io, re, json, base64, hashlib, warnings, unicodedata
+from dataclasses import dataclass
+from typing import Any, List, Dict, Tuple, Optional
 from datetime import datetime, date, timedelta, timezone as TZ
 
 import pandas as pd
@@ -39,42 +43,37 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
-# ── Quiet noisy libs ──────────────────────────────────────────────────────────
+# ── Quiet the noise ───────────────────────────────────────────────────────────
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 warnings.filterwarnings("ignore", category=FutureWarning, module="pandas")
-
-# ── UTF-8 console ────────────────────────────────────────────────────────────
-if sys.getdefaultencoding().lower() != "utf-8":
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
 
 # ── Constants ────────────────────────────────────────────────────────────────
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
-# File name regex (can override via DS_FILENAME_REGEX)
+# Filename regex (default)
 DS_FILENAME_REGEX_DEFAULT = r"(?i)\b(DS|Devis[ _-]?Service|Bon[ _-]?de[ _-]?Réparation)\b"
 
-# Fixed header row (0-based). Default=1 → Excel row 2.
-DEFAULT_DS_HEADER_ROW = 1
+# Header row (0-based): DS on Excel row 2
+DS_HEADER_ROW = 1
 
-# Header map (LEFT = Excel label, RIGHT = canonical name)
+# Header map: LEFT = expected Excel label, RIGHT = canonical name
 DS_HEADERS_MAP: Dict[str, str] = {
     "Date DS": "date_ds",
     "Description": "description_ds",
     "Désignation article": "designation_article_ds",
-    "Founisseur": "fournisseur_ds",  # keep typo per source
+    "Founisseur": "fournisseur_ds",  # keep the exact typo as used in your file
     "Immatriculation": "imm",
     "KM": "km_ds",
     "N°DS": "nds_ds",
     "Prix Unitaire ds": "prix_unitaire_ds_ds",
     "Qté": "qte_ds",
     "ENTITE": "entite_ds",
-    "Technicein": "technicien",      # keep typo per source
+    "Technicein": "technicien",      # keep the exact typo as used in your file
     "Code art": "code_art",
 }
 
-# DS downstream fields (used in lines)
+# DS downstream fields for line canonicalization
 DS_LINE_FIELDS = [
     "date_ds","description_ds","designation_article_ds","fournisseur_ds","imm","km_ds",
     "nds_ds","prix_unitaire_ds_ds","qte_ds","entite_ds","technicien","code_art","imm_norm","ww_norm"
@@ -87,6 +86,15 @@ _EXCEL_EPOCH = datetime(1899, 12, 30)
 def log(msg: str) -> None:
     ts = datetime.now(TZ.utc).strftime("%Y-%m-%d %H:%M:%SZ")
     print(f"[{ts}] {msg}")
+
+class Stepper:
+    def __init__(self) -> None: self.i = 0
+    def step(self, title: str) -> None:
+        self.i += 1
+        sep = "─" * max(8, 64 - len(title))
+        log(f"STEP {self.i}: {title} {sep}")
+
+STEP = Stepper()
 
 def _txt(x: Any) -> Optional[str]:
     if x is None or (isinstance(x, float) and pd.isna(x)): return None
@@ -119,36 +127,51 @@ def _sha256_json(obj: Any) -> str:
     payload = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-# ── Mongo plumbing ───────────────────────────────────────────────────────────
-def get_client_db(uri: str, dbname: str):
-    log("STEP 6: Connect to MongoDB ────────────────────────────────────────────")
-    try:
-        client = MongoClient(
-            uri,
-            serverSelectionTimeoutMS=20000,
-            socketTimeoutMS=300000,
-            connectTimeoutMS=20000,
-            maxPoolSize=100,
-            compressors="zstd,snappy,zlib",
-            retryWrites=True,
-            appname="etl-upsert-ds-only",
-        )
-        db = client.get_database(dbname, write_concern=WriteConcern(w=1))
-        client.admin.command("ping")
-        log("Mongo ping OK")
-        return client, db
-    except Exception as e:
-        raise RuntimeError(f"Mongo connection failed: {e}")
+def _norm_label(s: str) -> str:
+    """Strict normalization: lowercase, strip accents, remove punctuation, collapse spaces."""
+    if s is None:
+        return ""
+    s = " ".join(str(s).strip().split())  # collapse internal spaces
+    s = s.lower()
+    s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+    s = re.sub(r"[^0-9a-z ]+", "", s)  # keep alnum + space
+    s = " ".join(s.split())
+    return s
 
-def ensure_ds_indexes(db):
-    log("STEP 9: Ensure DS indexes ─────────────────────────────────────────────")
-    for f in ("nds_ds","imm_norm","ww_norm","vehicle_id","lines_sig"):
-        db.ds.create_index(f)
-    log("Indexes ensured")
+# ── Errors ───────────────────────────────────────────────────────────────────
+class ConfigError(RuntimeError): ...
+class DriveError(RuntimeError): ...
+class TransformError(RuntimeError): ...
+class UpsertError(RuntimeError): ...
 
-# ── Google Drive client ──────────────────────────────────────────────────────
-def build_drive(creds_b64: str):
-    log("STEP 2: Authenticate to Google Drive ──────────────────────────────────")
+# ── Config ───────────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class Config:
+    mongo_uri: str
+    mongo_db: str
+    creds_b64: str
+    drive_folder_id: str
+    ds_regex: str
+
+def load_config() -> Config:
+    STEP.step("Load configuration")
+    load_dotenv(override=False)
+
+    mongo_uri = os.getenv("MONGODB_URI")
+    mongo_db  = os.getenv("MONGODB_DB")
+    creds_b64 = os.getenv("GOOGLE_CREDENTIALS_BASE64")
+    folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
+    if not (mongo_uri and mongo_db and creds_b64 and folder_id):
+        raise ConfigError("Missing one of: MONGODB_URI, MONGODB_DB, GOOGLE_CREDENTIALS_BASE64, GOOGLE_DRIVE_FOLDER_ID")
+
+    ds_regex = os.getenv("DS_FILENAME_REGEX", DS_FILENAME_REGEX_DEFAULT)
+    log(f"Using DS regex: {ds_regex}")
+
+    return Config(mongo_uri, mongo_db, creds_b64, folder_id, ds_regex)
+
+# ── Drive ────────────────────────────────────────────────────────────────────
+def make_drive(creds_b64: str):
+    STEP.step("Authenticate to Google Drive")
     try:
         info = json.loads(base64.b64decode(creds_b64).decode("utf-8"))
         creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
@@ -156,7 +179,7 @@ def build_drive(creds_b64: str):
         log("Drive auth OK")
         return svc
     except Exception as e:
-        raise RuntimeError(f"Drive auth failed: {e}")
+        raise DriveError(f"Drive auth failed: {e}")
 
 def list_folder_files(drive, folder_id: str) -> List[Dict[str, Any]]:
     q = f"'{folder_id}' in parents and trashed=false"
@@ -175,21 +198,6 @@ def list_folder_files(drive, folder_id: str) -> List[Dict[str, Any]]:
 def _looks_like_xlsx(name: str, mime: str) -> bool:
     return name.lower().endswith(".xlsx") and mime == XLSX_MIME
 
-def pick_latest_ds_xlsx(drive, folder_id: str, name_regex: str) -> Tuple[str, str]:
-    """
-    Newest file whose NAME matches regex AND mime is XLSX AND .xlsx extension.
-    Returns (file_id, file_name). Raises if none.
-    """
-    log("STEP 3: Pick DS XLSX from Drive ──────────────────────────────────────")
-    rx = re.compile(name_regex)
-    files = list_folder_files(drive, folder_id)
-    for f in files:
-        fid, name, mime = f.get("id"), f.get("name",""), f.get("mimeType","")
-        if rx.search(name) and _looks_like_xlsx(name, mime):
-            log(f"Candidate: {name} (mime ok)")
-            return fid, name
-    raise RuntimeError("No valid DS XLSX found (regex + MIME + .xlsx).")
-
 def download_xlsx(drive, file_id: str, out_path: str) -> str:
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     req = drive.files().get_media(fileId=file_id)
@@ -199,26 +207,77 @@ def download_xlsx(drive, file_id: str, out_path: str) -> str:
         while not done:
             _, done = downloader.next_chunk()
     if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
-        raise RuntimeError("Downloaded XLSX is empty")
+        raise DriveError("Downloaded XLSX is empty")
     return out_path
 
-# ── Read+rename (keep only mapped headers) ───────────────────────────────────
-def read_keep_rename_ds(path: str, header_row: int) -> pd.DataFrame:
-    """
-    Read sheet with headers at header_row.
-    Keep only headers in DS_HEADERS_MAP; rename to canonical.
-    Accept if ≥1 mapped header is present; else error.
-    """
-    log("STEP 5: Read DS (keep+rename only mapped headers) ─────────────────────")
-    df = pd.read_excel(path, header=header_row, engine="openpyxl")
-    present = [c for c in df.columns if c in DS_HEADERS_MAP]
-    if not present:
-        raise RuntimeError(f"DS: none of the expected headers found at row {header_row}. Found={list(df.columns)}")
-    df = df[present].rename(columns={c: DS_HEADERS_MAP[c] for c in present}).copy()
-    log(f"DS: kept -> {list(df.columns)}")
-    return df
+def pick_and_fetch_ds(drive, folder_id: str, name_regex: str) -> Tuple[str, str, str]:
+    STEP.step("Find valid XLSX for ds.xlsx")
+    rx = re.compile(name_regex)
+    files = list_folder_files(drive, folder_id)
+    if not files:
+        raise DriveError("Folder is empty")
 
-# ── DS transform to docs ─────────────────────────────────────────────────────
+    for f in files:
+        fid  = f.get("id")
+        name = f.get("name", "")
+        mime = f.get("mimeType", "")
+        if not (rx.search(name) and _looks_like_xlsx(name, mime)):
+            continue
+        log(f"Candidate: {name} (mime ok)")
+        tmp = "data/.tmp_ds.xlsx"
+        download_xlsx(drive, fid, tmp)
+
+        final_path = "data/ds.xlsx"
+        try:
+            if os.path.exists(final_path):
+                os.remove(final_path)
+        except Exception:
+            pass
+        os.replace(tmp, final_path)
+        log(f"Accepted: {name}")
+        return fid, name, final_path
+
+    raise DriveError("No XLSX matched regex + MIME + extension for DS.")
+
+# ── STRICT keep+rename reader for DS ─────────────────────────────────────────
+def read_ds_strict(path: str, header_row: int, header_map: Dict[str, str]) -> pd.DataFrame:
+    """
+    Strict matching:
+      - normalize expected labels and sheet columns (lowercase, strip accents, no punct, collapse spaces)
+      - exact equality on normalized strings
+      - keep+rename matched columns; error if none matched
+    """
+    STEP.step("Read DS (keep+rename, STRICT headers)")
+    df = pd.read_excel(path, header=header_row, engine="openpyxl")
+
+    # Build normalized lookup for expected headers
+    norm_expected_to_canonical: Dict[str, str] = {}
+    for raw, canonical in header_map.items():
+        norm_expected_to_canonical[_norm_label(raw)] = canonical
+
+    # Build normalized lookup for actual columns
+    norm_col_to_actual: Dict[str, str] = {}
+    for c in df.columns:
+        norm_col_to_actual[_norm_label(c)] = c
+
+    # Exact normalized matches
+    matched: Dict[str, Tuple[str, float]] = {}  # canonical -> (actual_col, score=1.0)
+    for ne, canonical in norm_expected_to_canonical.items():
+        if ne in norm_col_to_actual:
+            actual = norm_col_to_actual[ne]
+            matched[canonical] = (actual, 1.0)
+            log(f"DS: matched '{canonical}' <- '{actual}' (strict)")
+
+    if not matched:
+        raise TransformError(f"DS: none of the expected headers found (strict normalized match) at row {header_row}.")
+
+    keep_cols = [actual for (actual, _) in matched.values()]
+    rename_map = {actual: canonical for canonical, (actual, _) in matched.items()}
+    out = df[keep_cols].rename(columns=rename_map).copy()
+    log(f"DS: kept -> {list(out.columns)}")
+    return out
+
+# ── DS doc building ──────────────────────────────────────────────────────────
 def normalize_ds_df(df: pd.DataFrame) -> pd.DataFrame:
     if "date_ds" in df.columns:
         df["date_ds"] = df["date_ds"].map(_iso_date_from_any)
@@ -244,18 +303,16 @@ def canonicalize_lines(df_group: pd.DataFrame) -> List[Dict[str, Any]]:
     return rows
 
 def build_ds_docs(df_raw: pd.DataFrame) -> List[Dict[str, Any]]:
-    log("STEP 7: Build DS documents ────────────────────────────────────────────")
+    STEP.step("Build DS documents")
     df = normalize_ds_df(df_raw.copy())
-    # Keep rows that have an identifier
+    # require imm_norm or ww_norm to consider a line
     mask = df.apply(lambda r: bool(_txt(r.get("imm_norm")) or _txt(r.get("ww_norm"))), axis=1)
     df = df[mask].copy()
-    if df.empty:
-        return []
+    if df.empty: return []
     docs: List[Dict[str, Any]] = []
     for ds_no, g in df.groupby("nds_ds", dropna=False, sort=False):
         _id = _txt(ds_no)
-        if not _id:
-            continue
+        if not _id: continue
         lines = canonicalize_lines(g)
         imm_norm = _txt(g.get("imm_norm").dropna().iloc[0]) if "imm_norm" in g and not g["imm_norm"].dropna().empty else None
         ww_norm  = _txt(g.get("ww_norm").dropna().iloc[0])  if "ww_norm"  in g and not g["ww_norm"].dropna().empty  else None
@@ -275,14 +332,43 @@ def build_ds_docs(df_raw: pd.DataFrame) -> List[Dict[str, Any]]:
     log(f"DS docs: {len(docs)}")
     return docs
 
-# ── Upsert helpers ───────────────────────────────────────────────────────────
+# ── Mongo plumbing ───────────────────────────────────────────────────────────
+def get_client_db(uri: str, dbname: str):
+    STEP.step("Connect to MongoDB")
+    try:
+        client = MongoClient(
+            uri,
+            serverSelectionTimeoutMS=20000,
+            socketTimeoutMS=300000,
+            connectTimeoutMS=20000,
+            maxPoolSize=100,
+            compressors="zstd,snappy,zlib",
+            retryWrites=True,
+            appname="etl-upsert-ds",
+        )
+        db = client.get_database(dbname, write_concern=WriteConcern(w=1))
+        client.admin.command("ping")
+        log("Mongo ping OK")
+        return client, db
+    except Exception as e:
+        raise UpsertError(f"Mongo connection failed: {e}")
+
+def ensure_ds_indexes(db) -> None:
+    STEP.step("Ensure ds indexes")
+    try:
+        for f in ("nds_ds","imm_norm","ww_norm","vehicle_id","lines_sig"):
+            db.ds.create_index(f)
+        log("ds indexes ensured")
+    except Exception as e:
+        raise UpsertError(f"Creating ds indexes failed: {e}")
+
 def _preload_sig(db, ids: List[str]) -> Dict[str, Optional[str]]:
     if not ids: return {}
     cur = db.ds.find({"_id": {"$in": ids}}, {"_id": 1, "lines_sig": 1})
     return {str(d["_id"]): d.get("lines_sig") for d in cur}
 
 def upsert_ds(db, docs: List[Dict[str, Any]]) -> Dict[str,int]:
-    log("STEP 8: Upsert DS ─────────────────────────────────────────────────────")
+    STEP.step("Upsert ds")
     if not docs:
         log("No DS docs to upsert")
         return {"inserted":0,"updated":0,"skipped":0}
@@ -302,54 +388,30 @@ def upsert_ds(db, docs: List[Dict[str, Any]]) -> Dict[str,int]:
         ops.append(UpdateOne({"_id": d["_id"]}, {"$set": {**d, "updated_at": now}}, upsert=True))
     if ops:
         db.ds.bulk_write(ops, ordered=False, bypass_document_validation=True)
-    log(f"DS → inserted={ins} updated={upd} skipped={skp}")
+    log(f"ds → inserted={ins} updated={upd} skipped={skp}")
     return {"inserted":ins,"updated":upd,"skipped":skp}
 
 # ── Orchestration ────────────────────────────────────────────────────────────
-def main():
-    log("STEP 1: Load configuration ─────────────────────────────────────────────")
-    load_dotenv(override=False)
+@dataclass(frozen=True)
+class RunCfg:
+    mongo_uri: str; mongo_db: str; creds_b64: str; drive_folder_id: str; ds_regex: str
 
-    mongo_uri = os.getenv("MONGODB_URI")
-    mongo_db  = os.getenv("MONGODB_DB")
-    creds_b64 = os.getenv("GOOGLE_CREDENTIALS_BASE64")
-    folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
-    if not (mongo_uri and mongo_db and creds_b64 and folder_id):
-        raise SystemExit("[ERROR] Missing MONGODB_URI / MONGODB_DB / GOOGLE_CREDENTIALS_BASE64 / GOOGLE_DRIVE_FOLDER_ID")
+def run(cfg: RunCfg) -> None:
+    log("BEGIN DS-only load")
+    drive = make_drive(cfg.creds_b64)
 
-    ds_regex = os.getenv("DS_FILENAME_REGEX", DS_FILENAME_REGEX_DEFAULT)
-    try:
-        header_row = int(os.getenv("DS_HEADER_ROW", str(DEFAULT_DS_HEADER_ROW)))
-    except ValueError:
-        header_row = DEFAULT_DS_HEADER_ROW
+    # Pick + download ds.xlsx
+    _, ds_name, ds_path = pick_and_fetch_ds(drive, cfg.drive_folder_id, cfg.ds_regex)
+    log(f"DS   → {ds_name}")
 
-    log(f"Using DS regex: {ds_regex}")
-    log(f"Using DS header row (0-based): {header_row}")
-
-    # Drive
-    drive = build_drive(creds_b64)
-
-    # Pick newest DS xlsx
-    fid, name = pick_latest_ds_xlsx(drive, folder_id, ds_regex)
-
-    # Download
-    log("STEP 4: Download DS XLSX ──────────────────────────────────────────────")
-    local_path = "data/ds.xlsx"
-    os.makedirs("data", exist_ok=True)
-    if os.path.exists(local_path):
-        try: os.remove(local_path)
-        except Exception: pass
-    download_xlsx(drive, fid, local_path)
-    log(f"Downloaded: {name} → {local_path}")
-
-    # Read + rename (keep only mapped headers)
-    df_ds = read_keep_rename_ds(local_path, header_row=header_row)
+    # Read + transform
+    df_ds = read_ds_strict(ds_path, DS_HEADER_ROW, DS_HEADERS_MAP)
 
     # Build docs
     ds_docs = build_ds_docs(df_ds)
 
     # Upsert
-    client, db = get_client_db(mongo_uri, mongo_db)
+    client, db = get_client_db(cfg.mongo_uri, cfg.mongo_db)
     try:
         stats = upsert_ds(db, ds_docs)
         ensure_ds_indexes(db)
@@ -358,14 +420,18 @@ def main():
         except Exception: pass
 
     log(f"UPSERT DS: {stats}")
-    log("DONE")
+    log("END DS-only load")
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    if sys.getdefaultencoding().lower() != "utf-8":
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
     try:
-        main()
-    except SystemExit as e:
-        print(e)
+        cfg = load_config()
+        run(RunCfg(cfg.mongo_uri, cfg.mongo_db, cfg.creds_b64, cfg.drive_folder_id, cfg.ds_regex))
+    except (ConfigError, DriveError, TransformError, UpsertError) as e:
+        log(f"ERROR: {e}")
         sys.exit(2)
     except Exception as e:
         log(f"FATAL: {type(e).__name__}: {e}")
