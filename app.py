@@ -3,27 +3,6 @@
 
 """
 appds.py — DS-only loader (STRICT headers; XLSX-only) matching main.py DS contract 1:1
-
-Behavior (env):
-  • GOOGLE_CREDENTIALS_BASE64  (required, service account JSON base64)
-  • GOOGLE_DRIVE_FOLDER_ID     (required)
-  • MONGODB_URI                (required)
-  • MONGODB_DB                 (required)
-  • DS_FILENAME_REGEX          (optional; default matches DS terms)
-
-Process:
-  1) Authenticate Drive (service account).
-  2) Find newest file in folder whose NAME matches DS regex AND MIME is XLSX AND endswith .xlsx.
-  3) Download to data/ds.xlsx.
-  4) Read Excel with headers at row 2 (0-based header=1), STRICT normalized match against DS_HEADERS_MAP.
-     - Keep ONLY mapped headers; rename to canonical; drop everything else.
-     - Error if none of the mapped headers is found.
-  5) Build DS docs (exact same structure/fields/signature as in main.py).
-  6) Upsert to Mongo (skip unchanged by lines_sig) + ensure ds indexes.
-  7) Log each step; suppress noisy warnings.
-
-Strict header matching = only accents/case/spacing/punctuation may differ.
-If your sheet truly uses a different label, add it as another LEFT key in DS_HEADERS_MAP.
 """
 
 from __future__ import annotations
@@ -50,30 +29,26 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="pandas")
 # ── Constants ────────────────────────────────────────────────────────────────
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-
-# Filename regex (default)
-DS_FILENAME_REGEX_DEFAULT = r"(?i)\b(DS|Devis[ _-]?Service|Bon[ _-]?de[ _-]?Réparation)\b"
-
-# Header row (0-based): DS on Excel row 2
+DS_FILENAME_REGEX_DEFAULT = r"(?i)\b(DS|Devis[ _-]?Service|Bon[ _-]?de[ _-]?(?:R[eé]paration))\b"
 DS_HEADER_ROW = 1
 
 # Header map: LEFT = expected Excel label, RIGHT = canonical name
 DS_HEADERS_MAP: Dict[str, str] = {
     "Date DS": "date_ds",
     "Description": "description_ds",
-    "Désignation article": "designation_article_ds",
-    "Founisseur": "fournisseur_ds",  # keep the exact typo as used in your file
+    "Désignation Consomation": "designation_article_ds",  # your sheet's current label
+    "Founisseur": "fournisseur_ds",
     "Immatriculation": "imm",
     "KM": "km_ds",
     "N°DS": "nds_ds",
     "Prix Unitaire ds": "prix_unitaire_ds_ds",
     "Qté": "qte_ds",
     "ENTITE": "entite_ds",
-    "Technicein": "technicien",      # keep the exact typo as used in your file
+    "Technicein": "technicien",
     "Code art": "code_art",
+    # "WW": "ww",  # uncomment if present in DS
 }
 
-# DS downstream fields for line canonicalization
 DS_LINE_FIELDS = [
     "date_ds","description_ds","designation_article_ds","fournisseur_ds","imm","km_ds",
     "nds_ds","prix_unitaire_ds_ds","qte_ds","entite_ds","technicien","code_art","imm_norm","ww_norm"
@@ -82,6 +57,7 @@ DS_LINE_FIELDS = [
 # ── Small utils ───────────────────────────────────────────────────────────────
 _ALNUM = re.compile(r"[^0-9A-Za-z]")
 _EXCEL_EPOCH = datetime(1899, 12, 30)
+_EXCEL_ESC_RE = re.compile(r"_x([0-9A-Fa-f]{4})_")  # Excel XML escape pattern
 
 def log(msg: str) -> None:
     ts = datetime.now(TZ.utc).strftime("%Y-%m-%d %H:%M:%SZ")
@@ -129,14 +105,41 @@ def _sha256_json(obj: Any) -> str:
 
 def _norm_label(s: str) -> str:
     """Strict normalization: lowercase, strip accents, remove punctuation, collapse spaces."""
-    if s is None:
-        return ""
-    s = " ".join(str(s).strip().split())  # collapse internal spaces
+    if s is None: return ""
+    s = " ".join(str(s).strip().split())
     s = s.lower()
     s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
-    s = re.sub(r"[^0-9a-z ]+", "", s)  # keep alnum + space
+    s = re.sub(r"[^0-9a-z ]+", "", s)
     s = " ".join(s.split())
     return s
+
+# ── Decode Excel XML escapes in cell values ───────────────────────────────────
+def _decode_excel_escapes_to_text(s: Any) -> Any:
+    """Turn '_x000A_' / '_x000D_' / '_x0009_' etc. into readable text.
+       LF/CR/TAB → single space; other codes → their Unicode char (if printable).
+       Collapse runs of whitespace and trim."""
+    if not isinstance(s, str):
+        return s
+    def repl(m):
+        code = m.group(1)
+        code_lower = code.lower()
+        if code_lower in ("000a","000d","0009"):  # LF, CR, TAB → space
+            return " "
+        try:
+            ch = chr(int(code, 16))
+            return " " if ord(ch) < 32 else ch
+        except Exception:
+            return " "
+    s = _EXCEL_ESC_RE.sub(repl, s)
+    s = re.sub(r"[ \t\r\n]+", " ", s).strip()
+    return s
+
+def _clean_dataframe_excel_escapes(df: pd.DataFrame) -> pd.DataFrame:
+    # Only touch object (string) columns for speed and safety
+    obj_cols = df.select_dtypes(include=["object"]).columns
+    for c in obj_cols:
+        df[c] = df[c].map(_decode_excel_escapes_to_text)
+    return df
 
 # ── Errors ───────────────────────────────────────────────────────────────────
 class ConfigError(RuntimeError): ...
@@ -242,13 +245,17 @@ def pick_and_fetch_ds(drive, folder_id: str, name_regex: str) -> Tuple[str, str,
 # ── STRICT keep+rename reader for DS ─────────────────────────────────────────
 def read_ds_strict(path: str, header_row: int, header_map: Dict[str, str]) -> pd.DataFrame:
     """
-    Strict matching:
+    Strict matching with value cleanup:
       - normalize expected labels and sheet columns (lowercase, strip accents, no punct, collapse spaces)
       - exact equality on normalized strings
       - keep+rename matched columns; error if none matched
+      - decode Excel XML escapes in **cell values** so '_x000A_' etc. don't leak to UI
     """
     STEP.step("Read DS (keep+rename, STRICT headers)")
     df = pd.read_excel(path, header=header_row, engine="openpyxl")
+
+    # Clean encoded control chars in values (before slicing/renaming is fine)
+    df = _clean_dataframe_excel_escapes(df)
 
     # Build normalized lookup for expected headers
     norm_expected_to_canonical: Dict[str, str] = {}
@@ -261,7 +268,7 @@ def read_ds_strict(path: str, header_row: int, header_map: Dict[str, str]) -> pd
         norm_col_to_actual[_norm_label(c)] = c
 
     # Exact normalized matches
-    matched: Dict[str, Tuple[str, float]] = {}  # canonical -> (actual_col, score=1.0)
+    matched: Dict[str, Tuple[str, float]] = {}
     for ne, canonical in norm_expected_to_canonical.items():
         if ne in norm_col_to_actual:
             actual = norm_col_to_actual[ne]
@@ -305,14 +312,16 @@ def canonicalize_lines(df_group: pd.DataFrame) -> List[Dict[str, Any]]:
 def build_ds_docs(df_raw: pd.DataFrame) -> List[Dict[str, Any]]:
     STEP.step("Build DS documents")
     df = normalize_ds_df(df_raw.copy())
-    # require imm_norm or ww_norm to consider a line
     mask = df.apply(lambda r: bool(_txt(r.get("imm_norm")) or _txt(r.get("ww_norm"))), axis=1)
     df = df[mask].copy()
-    if df.empty: return []
+    if df.empty:
+        log("DS: no valid rows after vehicle id filter (imm_norm/ww_norm)")
+        return []
     docs: List[Dict[str, Any]] = []
     for ds_no, g in df.groupby("nds_ds", dropna=False, sort=False):
         _id = _txt(ds_no)
-        if not _id: continue
+        if not _id:
+            continue
         lines = canonicalize_lines(g)
         imm_norm = _txt(g.get("imm_norm").dropna().iloc[0]) if "imm_norm" in g and not g["imm_norm"].dropna().empty else None
         ww_norm  = _txt(g.get("ww_norm").dropna().iloc[0])  if "ww_norm"  in g and not g["ww_norm"].dropna().empty  else None
@@ -322,6 +331,7 @@ def build_ds_docs(df_raw: pd.DataFrame) -> List[Dict[str, Any]]:
         docs.append({
             "_id": _id,
             "ds_no": _id,
+            "nds_ds": _id,            # indexable top-level field
             "vehicle_id": vehicle_id,
             "imm_norm": imm_norm,
             "ww_norm": ww_norm,
@@ -342,7 +352,7 @@ def get_client_db(uri: str, dbname: str):
             socketTimeoutMS=300000,
             connectTimeoutMS=20000,
             maxPoolSize=100,
-            compressors="zstd,snappy,zlib",
+            compressors=["zstd","snappy","zlib"],
             retryWrites=True,
             appname="etl-upsert-ds",
         )
@@ -385,7 +395,14 @@ def upsert_ds(db, docs: List[Dict[str, Any]]) -> Dict[str,int]:
             continue
         else:
             upd += 1
-        ops.append(UpdateOne({"_id": d["_id"]}, {"$set": {**d, "updated_at": now}}, upsert=True))
+        ops.append(UpdateOne(
+            {"_id": d["_id"]},
+            {
+                "$set": {**d, "updated_at": now},
+                "$setOnInsert": {"created_at": now},
+            },
+            upsert=True
+        ))
     if ops:
         db.ds.bulk_write(ops, ordered=False, bypass_document_validation=True)
     log(f"ds → inserted={ins} updated={upd} skipped={skp}")
@@ -399,18 +416,10 @@ class RunCfg:
 def run(cfg: RunCfg) -> None:
     log("BEGIN DS-only load")
     drive = make_drive(cfg.creds_b64)
-
-    # Pick + download ds.xlsx
     _, ds_name, ds_path = pick_and_fetch_ds(drive, cfg.drive_folder_id, cfg.ds_regex)
     log(f"DS   → {ds_name}")
-
-    # Read + transform
     df_ds = read_ds_strict(ds_path, DS_HEADER_ROW, DS_HEADERS_MAP)
-
-    # Build docs
     ds_docs = build_ds_docs(df_ds)
-
-    # Upsert
     client, db = get_client_db(cfg.mongo_uri, cfg.mongo_db)
     try:
         stats = upsert_ds(db, ds_docs)
@@ -418,7 +427,6 @@ def run(cfg: RunCfg) -> None:
     finally:
         try: client.close()
         except Exception: pass
-
     log(f"UPSERT DS: {stats}")
     log("END DS-only load")
 

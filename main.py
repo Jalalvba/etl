@@ -7,9 +7,10 @@ main.py — DS / CP / PARC loader with strict headers and CP deduplication
 Highlights:
   • DS, CP, PARC loaded from Google Drive (XLSX)
   • Strict header normalization (lowercase, accents stripped, punctuation removed)
+  • Excel XML escapes decoded in cell values (e.g., '_x000A_' → space) to avoid UI artifacts
   • CP deduplicated by imm_norm, keeping only row with latest 'Date fin contrat'
   • Dates like '03-09-2025' normalized to '2025-09-03'
-  • DS, CP, PARC upserts with id + content signature (skip if unchanged)
+  • Upserts with content signatures (skip unchanged)
 """
 
 import os, re, io, json, base64, hashlib, unicodedata, warnings
@@ -32,7 +33,7 @@ SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 # Exact labels expected in the XLSX files (row headers at the given header rows)
 DS_HEADERS_MAP = {
     "Date DS": "date_ds", "Description": "description_ds",
-    "Désignation article": "designation_article_ds", "Founisseur": "fournisseur_ds",
+    "Désignation Consomation": "designation_article_ds", "Founisseur": "fournisseur_ds",
     "Immatriculation": "imm", "KM": "km_ds", "N°DS": "nds_ds",
     "Prix Unitaire ds": "prix_unitaire_ds_ds", "Qté": "qte_ds",
     "ENTITE": "entite_ds", "Technicein": "technicien", "Code art": "code_art",
@@ -50,6 +51,7 @@ PARC_HEADERS_MAP = {
 
 _ALNUM = re.compile(r"[^0-9A-Za-z]")
 _EXCEL_EPOCH = datetime(1899, 12, 30, tzinfo=TZ.utc)
+_EXCEL_ESC_RE = re.compile(r"_x([0-9A-Fa-f]{4})_")  # Excel XML escape (LF/CR/TAB etc.)
 
 # ── Helpers ──────────────────────────────────────────────────────────
 def log(msg): print(f"[{datetime.now(TZ.utc).strftime('%Y-%m-%d %H:%M:%SZ')}] {msg}")
@@ -92,6 +94,33 @@ def _sha256_json(obj):
     payload = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(payload.encode()).hexdigest()
 
+# ── Decode Excel XML escapes in cell values ──────────────────────────
+def _decode_excel_escapes_to_text(s):
+    """
+    Turn '_x000A_'/'_x000D_'/'_x0009_' into readable text.
+    LF/CR/TAB → single space (keeps UI tidy); other codes → their Unicode char if printable.
+    Collapse repeated whitespace and trim.
+    """
+    if not isinstance(s, str): return s
+    def repl(m):
+        code = m.group(1).lower()
+        if code in ("000a","000d","0009"):  # \n, \r, \t
+            return " "
+        try:
+            ch = chr(int(code, 16))
+            return " " if ord(ch) < 32 else ch
+        except Exception:
+            return " "
+    s = _EXCEL_ESC_RE.sub(repl, s)
+    s = re.sub(r"[ \t\r\n]+", " ", s).strip()
+    return s
+
+def _clean_dataframe_excel_escapes(df: pd.DataFrame) -> pd.DataFrame:
+    obj_cols = df.select_dtypes(include=["object"]).columns
+    for c in obj_cols:
+        df[c] = df[c].map(_decode_excel_escapes_to_text)
+    return df
+
 # ── Drive download ───────────────────────────────────────────────────
 def make_drive(creds_b64):
     info = json.loads(base64.b64decode(creds_b64))
@@ -105,7 +134,7 @@ def download_xlsx(drive, fid, out):
         downloader = MediaIoBaseDownload(f, req)
         done = False
         while not done:
-            status, done = downloader.next_chunk()
+            _, done = downloader.next_chunk()
     return out
 
 def pick(drive, folder_id, regex, tmp, final):
@@ -124,10 +153,13 @@ def pick(drive, folder_id, regex, tmp, final):
             return f["id"], f["name"], f"data/{final}"
     raise RuntimeError("No matching XLSX found")
 
-# ── Strict header reader ─────────────────────────────────────────────
+# ── Strict header reader (+ value cleanup) ──────────────────────────
 def read_strict(path, header_row, header_map, label):
     log(f"Read {label}")
     df = pd.read_excel(path, header=header_row, engine="openpyxl")
+    # decode Excel XML escapes in ALL string cells
+    df = _clean_dataframe_excel_escapes(df)
+
     norm_expected = {_norm_label(k): v for k, v in header_map.items()}
     norm_actual = {_norm_label(c): c for c in df.columns}
     matched = {v: norm_actual[n] for n, v in norm_expected.items() if n in norm_actual}
@@ -139,6 +171,7 @@ def read_strict(path, header_row, header_map, label):
 
 # ── DS building ──────────────────────────────────────────────────────
 def build_ds_docs(df):
+    df = df.copy()
     df["date_ds"] = df["date_ds"].map(_iso_date_from_any)
     df["imm_norm"] = df["imm"].map(canon_plate)
     docs = []
@@ -146,8 +179,9 @@ def build_ds_docs(df):
         imm_norm = None
         if "imm_norm" in g and not g["imm_norm"].dropna().empty:
             imm_norm = _txt(g["imm_norm"].dropna().iloc[0])
+        # lines as plain records (already cleaned); if you prefer full canonicalization,
+        # we can sort and pick DS_LINE_FIELDS like in appds.py
         lines = g.to_dict(orient="records")
-        # Beware: pandas Timestamp → Python datetime (Mongo safe)
         date_event = pd.to_datetime(g["date_ds"], errors="coerce", utc=True).max()
         date_event = date_event.to_pydatetime() if pd.notna(date_event) else None
         docs.append({
@@ -163,6 +197,7 @@ def build_ds_docs(df):
 
 # ── CP handling ──────────────────────────────────────────────────────
 def process_cp(df):
+    df = df.copy()
     df["imm_norm"] = df["imm"].map(canon_plate)
     df["date_debut_cp"] = df["date_debut_cp"].map(_iso_date_from_any)
     df["date_fin_cp"] = df["date_fin_cp"].map(_iso_date_from_any)
@@ -179,7 +214,6 @@ def build_cp_docs(df):
         body = {k: (None if pd.isna(v) else v) for k, v in r.to_dict().items()}
         _id = body.get("imm_norm")
         if not _id:
-            # fallback if plate missing (rare): use VIN or WW as ID
             _id = canon_vin(body.get("vin")) or canon_plate(body.get("ww"))
         body["_id"] = _id
         body["doc_sig"] = _sha256_json(body)
@@ -187,9 +221,8 @@ def build_cp_docs(df):
     log(f"CP docs: {len(docs)}")
     return docs
 
-# ── PARC handling (NEW) ─────────────────────────────────────────────
+# ── PARC handling ───────────────────────────────────────────────────
 def build_parc_docs(df):
-    # Normalize IDs and dates
     df = df.copy()
     df["imm_norm"] = df["imm"].map(canon_plate) if "imm" in df else None
     df["vin_norm"] = df["vin"].map(canon_vin) if "vin" in df else None
@@ -201,10 +234,8 @@ def build_parc_docs(df):
     docs = []
     for _, r in df.iterrows():
         rec = {k: (None if pd.isna(v) else v) for k, v in r.to_dict().items()}
-        # Choose stable primary key: imm_norm, else VIN, else WW
         _id = rec.get("imm_norm") or rec.get("vin_norm") or rec.get("ww_norm")
         if not _id:
-            # last resort: skip rows with no identifier at all
             continue
         rec["_id"] = _id
         rec["vehicle_id"] = _id
@@ -215,12 +246,16 @@ def build_parc_docs(df):
 
 # ── Mongo plumbing ───────────────────────────────────────────────────
 def get_db(uri, dbname):
-    client = MongoClient(uri, serverSelectionTimeoutMS=20000, compressors="zstd,snappy,zlib")
+    client = MongoClient(
+        uri,
+        serverSelectionTimeoutMS=20000,
+        compressors=["zstd","snappy","zlib"],  # list, not comma-string
+    )
     client.admin.command("ping")
     return client, client.get_database(dbname, write_concern=WriteConcern(w=1))
 
 def upsert_with_sig(db, coll, docs, sig_field):
-    if not docs: 
+    if not docs:
         log(f"{coll} → inserted=0 updated=0 skipped=0 (no docs)")
         return {"inserted": 0, "updated": 0, "skipped": 0}
     ids = [d["_id"] for d in docs if "_id" in d]
@@ -269,7 +304,6 @@ def run(cfg):
     df_cp_unique = process_cp(df_cp)
     cp_docs = build_cp_docs(df_cp_unique)
 
-    # FIX: cfgv → cfg
     _,_,parc_path = pick(drive, cfg["GOOGLE_DRIVE_FOLDER_ID"], r"(?i)PARC", ".tmp_parc.xlsx", "parc.xlsx")
     df_parc = read_strict(parc_path, PARC_HEADER_ROW, PARC_HEADERS_MAP, "PARC")
     parc_docs = build_parc_docs(df_parc)
