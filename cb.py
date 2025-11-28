@@ -6,10 +6,15 @@ cb.py — Loader for Purchase Orders (CB/YBONC) from Google Drive → MongoDB 'c
 
 - Finds latest CB XLSX in a Drive folder (regex on file name)
 - Downloads it to data/cb.xlsx
-- STRICT header matching using CB_HEADERS_MAP (20 headers only)
+- STRICT header matching using CB_HEADERS_MAP (all CB headers)
 - Normalises plates, dates, numeric fields
-- Builds one MongoDB document per row (no grouping)
-- Stable upsert based on SHA-256 of the row payload (doc_sig)
+- Groups by BC number (N° BC) → ONE Mongo document per BC
+- Each document has:
+    • static/root fields (site, type BC, supplier, invoice info, etc.)
+    • imm_norm
+    • lines[] with article-level details
+    • total_ht_cb (root) based on sheet total
+    • doc_sig = sha256(JSON(lines))
 """
 
 from __future__ import annotations
@@ -60,52 +65,63 @@ CB_FILENAME_REGEX_DEFAULT = r"(?i)\b(YBONC|Bon[ _-]?de[ _-]?Commande|BC)\b"
 CB_HEADER_ROW = 1  # 0-based index: row 2 in Excel UI
 
 # Excel header label (left) -> canonical field name (right)
-# ONLY your 20 headers
 CB_HEADERS_MAP: Dict[str, str] = {
     "Site": "site_cb",
     "N° BC": "num_bc",
+    "Type BC": "type_bc_cb",
     "Immatriculation": "imm",
     "Date BC": "date_cb",
+    "Code frs": "code_frs_cb",
     "Fournisseurs": "supplier_cb",
+    "Cat. Article": "cat_article_cb",
+    "Code article": "code_article_cb",
     "Description article": "description_article_cb",
+    "Nature article": "nature_article_cb",
+    "Sous-nature article": "sous_nature_article_cb",
     "PU": "unit_price_cb",
     "Qté": "qty_cb",
+    "Prix brut pièce": "brut_price_cb",
+    "Remise article": "remise_article_cb",
     "Montant HT": "amount_ht_cb",
     "Total HT": "total_ht_cb",
     "Entité": "entity_cb",
+    "Marque": "marque_cb",
     "Signé": "signed_cb",
     "Commande Ferme": "firm_order_cb",
     "Réceptionné": "received_cb",
     "Cde origine": "origin_order_cb",
     "Soldé": "closed_cb",
+    "Achteur": "buyer_cb",
     "Crée par": "created_by_cb",
     "DS": "ds_cb",
+    "Type DS": "type_ds_cb",
+    "Client DS": "client_ds_cb",
     "KM": "km_cb",
     "Ville": "city_cb",
+    "N° facture": "invoice_no_cb",
+    "Date récéption": "invoice_date_cb",
+    "N° Facture fourn": "invoice_supplier_no_cb",
+    "Total facture": "invoice_total_cb",
+    "N° Avoir": "avoir_no_cb",
+    "MT Devise": "amount_devise_cb",
+    "Devise": "devise_cb",
+    "MT MAD": "amount_mad_cb",
 }
 
-# EXACTLY the same 20 logical fields for payload/signature
+# Fields that make up ONE line in lines[]
 CB_LINE_FIELDS: List[str] = [
-    "site_cb",
-    "num_bc",
-    "imm",
-    "date_cb",
-    "supplier_cb",
+    "cat_article_cb",
+    "code_article_cb",
     "description_article_cb",
+    "nature_article_cb",
+    "sous_nature_article_cb",
+    "marque_cb",
     "unit_price_cb",
     "qty_cb",
+    "brut_price_cb",
+    "remise_article_cb",
     "amount_ht_cb",
     "total_ht_cb",
-    "entity_cb",
-    "signed_cb",
-    "firm_order_cb",
-    "received_cb",
-    "origin_order_cb",
-    "closed_cb",
-    "created_by_cb",
-    "ds_cb",
-    "km_cb",
-    "city_cb",
 ]
 
 STEP = Stepper()
@@ -254,9 +270,9 @@ def read_cb_strict(path: str, header_row: int, header_map: Dict[str, str]) -> pd
 def normalize_cb_df(df: pd.DataFrame) -> pd.DataFrame:
     """
     Normalize CB fields:
-      - date_cb -> ISO string
-      - imm -> imm_norm (canon_plate)
-      - numeric columns -> numbers (float) where possible
+      - date_cb / invoice_date_cb → ISO string
+      - imm → imm_norm (canon_plate)
+      - numeric columns → float where possible
       - filter rows without imm_norm (no vehicle)
     """
     STEP.step("Normalize CB rows")
@@ -264,11 +280,26 @@ def normalize_cb_df(df: pd.DataFrame) -> pd.DataFrame:
     if "date_cb" in df.columns:
         df["date_cb"] = df["date_cb"].map(_iso_date_from_any)
 
+    if "invoice_date_cb" in df.columns:
+        df["invoice_date_cb"] = df["invoice_date_cb"].map(_iso_date_from_any)
+
     if "imm" in df.columns:
         df["imm_norm"] = df["imm"].map(canon_plate)
 
     # Numeric-like columns
-    for col in ("unit_price_cb", "qty_cb", "amount_ht_cb", "total_ht_cb", "km_cb"):
+    numeric_cols = [
+        "unit_price_cb",
+        "qty_cb",
+        "brut_price_cb",
+        "remise_article_cb",
+        "amount_ht_cb",
+        "total_ht_cb",
+        "km_cb",
+        "invoice_total_cb",
+        "amount_devise_cb",
+        "amount_mad_cb",
+    ]
+    for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -282,41 +313,156 @@ def normalize_cb_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ---------------------------------------------------------------------------
-# BUILD DOCUMENTS
+# BUILD DOCUMENTS (GROUP BY BC)
 # ---------------------------------------------------------------------------
+
+def _first_non_empty(series) -> Optional[str]:
+    """Return the first non-empty string from a pandas Series, or None."""
+    if series is None:
+        return None
+    for v in series.tolist():
+        s = _txt(v)
+        if s:
+            return s
+    return None
+
 
 def build_cb_docs(df_raw: pd.DataFrame) -> List[Dict[str, Any]]:
     """
-    Build one Mongo document per CB row.
+    Build one Mongo document per BC (num_bc), with detail lines.
 
-    - Uses ONLY the 20 logical CB_LINE_FIELDS for the payload/signature.
-    - Adds imm_norm as an extra technical field (derived from Immatriculation).
-    - _id/doc_sig = sha256(JSON of CB_LINE_FIELDS rendered as strings).
+    For each num_bc:
+      - root fields (static):
+          site_cb, num_bc, type_bc_cb, imm, imm_norm, date_cb,
+          code_frs_cb, supplier_cb, entity_cb, marque_cb, signed_cb,
+          firm_order_cb, received_cb, origin_order_cb, closed_cb,
+          buyer_cb, created_by_cb, ds_cb, type_ds_cb, client_ds_cb,
+          km_cb, city_cb,
+          invoice_* fields, devise / MT MAD / MT Devise, etc.
+      - lines: list of article-level fields (CB_LINE_FIELDS)
+      - total_ht_cb (root): first non-empty total_ht_cb in group,
+                            otherwise sum(amount_ht_cb)
+      - doc_sig: sha256(JSON(lines))
+      - _id: num_bc
     """
     STEP.step("Build CB documents")
 
     df = normalize_cb_df(df_raw.copy())
     if df.empty:
+        log("CB: empty after normalization")
+        return []
+
+    if "num_bc" not in df.columns:
+        log("CB: no 'num_bc' column, cannot group")
         return []
 
     docs: List[Dict[str, Any]] = []
 
-    for _, row in df.iterrows():
-        payload = {
-            k: _txt(row.get(k)) if k in df.columns else None
-            for k in CB_LINE_FIELDS
-        }
-        doc_sig = _sha256_json(payload)
+    # fields considered as "static" at BC level
+    static_fields = [
+        "site_cb",
+        "num_bc",
+        "type_bc_cb",
+        "imm",
+        "date_cb",
+        "code_frs_cb",
+        "supplier_cb",
+        "entity_cb",
+        "marque_cb",
+        "signed_cb",
+        "firm_order_cb",
+        "received_cb",
+        "origin_order_cb",
+        "closed_cb",
+        "buyer_cb",
+        "created_by_cb",
+        "ds_cb",
+        "type_ds_cb",
+        "client_ds_cb",
+        "km_cb",
+        "city_cb",
+        "invoice_no_cb",
+        "invoice_date_cb",
+        "invoice_supplier_no_cb",
+        "invoice_total_cb",
+        "avoir_no_cb",
+        "amount_devise_cb",
+        "devise_cb",
+        "amount_mad_cb",
+    ]
 
-        doc = {
-            "_id": doc_sig,
-            "doc_sig": doc_sig,
-            **payload,
-        }
+    for bc_no, g in df.groupby("num_bc", dropna=True, sort=False):
+        _id = _txt(bc_no)
+        if not _id:
+            continue
 
-        # extra technical field for queries (not part of 20 headers)
-        if "imm_norm" in df.columns:
-            doc["imm_norm"] = _txt(row.get("imm_norm"))
+        doc: Dict[str, Any] = {}
+
+        # static fields → first non-empty value in group
+        for f in static_fields:
+            if f in g.columns:
+                doc[f] = _first_non_empty(g[f])
+
+        # imm_norm (technical)
+        if "imm_norm" in g.columns:
+            doc["imm_norm"] = _first_non_empty(g["imm_norm"])
+
+        # ---- lines: one entry per row ----
+        lines: List[Dict[str, Any]] = []
+        for _, row in g.iterrows():
+            line = {}
+            for k in CB_LINE_FIELDS:
+                if k in g.columns:
+                    line[k] = _txt(row.get(k))
+                else:
+                    line[k] = None
+            lines.append(line)
+
+        # stable sort lines (by code + article + qty + price)
+        lines.sort(
+            key=lambda r: (
+                r.get("code_article_cb") or "",
+                r.get("description_article_cb") or "",
+                r.get("qty_cb") or "",
+                r.get("unit_price_cb") or "",
+            )
+        )
+
+        # ---- total_ht_cb at root ----
+        root_total = _first_non_empty(g.get("total_ht_cb")) if "total_ht_cb" in g.columns else None
+        if root_total is None:
+            # fallback = sum Montant HT
+            total = 0.0
+            if "amount_ht_cb" in g.columns:
+                for v in g["amount_ht_cb"]:
+                    try:
+                        total += float(v)
+                    except Exception:
+                        pass
+            doc["total_ht_cb"] = str(total) if total else None
+        else:
+            doc["total_ht_cb"] = root_total
+
+        # ---- amount_ht_cb at root (optional aggregate) ----
+        if "amount_ht_cb" in g.columns:
+            total_amt = 0.0
+            for v in g["amount_ht_cb"]:
+                try:
+                    total_amt += float(v)
+                except Exception:
+                    pass
+            doc["amount_ht_sum_cb"] = total_amt
+
+        # ---- signature & id ----
+        doc_sig = _sha256_json(lines)
+
+        doc.update(
+            {
+                "_id": _id,
+                "doc_sig": doc_sig,
+                "lines": lines,
+            }
+        )
 
         docs.append(doc)
 
