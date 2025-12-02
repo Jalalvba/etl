@@ -2,36 +2,36 @@
 # -*- coding: utf-8 -*-
 
 """
-cb.py — Loader for Purchase Orders (CB/YBONC) from Google Drive → MongoDB 'cb'
+cp.py — CP loader for long-term rental contracts.
 
-- Finds latest CB XLSX in a Drive folder (regex on file name)
-- Downloads it to data/cb.xlsx
-- STRICT header matching using CB_HEADERS_MAP (20 headers only)
-- Normalises plates, dates, numeric fields
-- Builds one MongoDB document per row (no grouping)
-- Stable upsert based on SHA-256 of the row payload (doc_sig)
+Pipeline:
+  • Fetch latest CP Excel (Drive or local override)
+  • Strict header read
+  • Normalize plates, VINs, dates
+  • Deduplicate (latest contract per imm_norm)
+  • Build stable Mongo documents
+  • Upsert by SHA-256 signature
+  • Ensure indexes and clean old duplicates
 """
 
-from __future__ import annotations
-
 import os
-import sys
-import io
 import re
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
-from datetime import datetime, timezone as TZ
+import io
+import warnings
+import argparse
+from datetime import datetime, timedelta, timezone as TZ
 
 import pandas as pd
 from dotenv import load_dotenv
-from pymongo import MongoClient, UpdateOne
+from pymongo import MongoClient, UpdateOne, ASCENDING
+from pymongo.errors import BulkWriteError
 from pymongo.write_concern import WriteConcern
 
 from helper import (
     log,
-    Stepper,
     _txt,
     canon_plate,
+    canon_vin,
     _iso_date_from_any,
     _norm_label,
     _sha256_json,
@@ -46,424 +46,334 @@ from helper import (
     UpsertError,
 )
 
-import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
-warnings.filterwarnings("ignore", category=FutureWarning, module="pandas")
 
-# ---------------------------------------------------------------------------
-# CONSTANTS
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Default regex to detect the CB file on Drive (can be overridden with CB_FILENAME_REGEX)
-CB_FILENAME_REGEX_DEFAULT = r"(?i)\b(YBONC|Bon[ _-]?de[ _-]?Commande|BC)\b"
+DEFAULT_CP_HEADER_ROW = 7  # 0-based header row index in Excel
 
-CB_HEADER_ROW = 1  # 0-based index: row 2 in Excel UI
-
-# Excel header label (left) -> canonical field name (right)
-# ONLY your 20 headers
-CB_HEADERS_MAP: Dict[str, str] = {
-    "Site": "site_cb",
-    "N° BC": "num_bc",
-    "Immatriculation": "imm",
-    "Date BC": "date_cb",
-    "Fournisseurs": "supplier_cb",
-    "Description article": "description_article_cb",
-    "PU": "unit_price_cb",
-    "Qté": "qty_cb",
-    "Montant HT": "amount_ht_cb",
-    "Total HT": "total_ht_cb",
-    "Entité": "entity_cb",
-    "Signé": "signed_cb",
-    "Commande Ferme": "firm_order_cb",
-    "Réceptionné": "received_cb",
-    "Cde origine": "origin_order_cb",
-    "Soldé": "closed_cb",
-    "Crée par": "created_by_cb",
-    "DS": "ds_cb",
-    "KM": "km_cb",
-    "Ville": "city_cb",
+CP_HEADERS_MAP = {
+    "IMM": "imm",
+    "NUM chassis": "vin",
+    "WW": "ww",
+    "Client": "client",
+    "Date début contrat": "date_debut_cp",
+    "Libellé version long": "modele_long",
+    "Date fin contrat": "date_fin_cp",
 }
 
-# EXACTLY the same 20 logical fields for payload/signature
-CB_LINE_FIELDS: List[str] = [
-    "site_cb",
-    "num_bc",
-    "imm",
-    "date_cb",
-    "supplier_cb",
-    "description_article_cb",
-    "unit_price_cb",
-    "qty_cb",
-    "amount_ht_cb",
-    "total_ht_cb",
-    "entity_cb",
-    "signed_cb",
-    "firm_order_cb",
-    "received_cb",
-    "origin_order_cb",
-    "closed_cb",
-    "created_by_cb",
-    "ds_cb",
-    "km_cb",
-    "city_cb",
-]
+# ─────────────────────────────────────────────────────────────────────────────
+# Drive: pick latest CP file
+# ─────────────────────────────────────────────────────────────────────────────
 
-STEP = Stepper()
-
-# ---------------------------------------------------------------------------
-# CONFIG
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class Config:
-    mongo_uri: str
-    mongo_db: str
-    creds_b64: str
-    drive_folder_id: str
-    cb_regex: str
-
-
-def load_config() -> Config:
+def pick_latest_cp(drive, folder_id: str) -> str:
     """
-    Load configuration from environment:
-      - MONGODB_URI
-      - MONGODB_DB
-      - GOOGLE_CREDENTIALS_BASE64
-      - CB_GOOGLE_DRIVE_FOLDER_ID or GOOGLE_DRIVE_FOLDER_ID
-      - CB_FILENAME_REGEX (optional, default CB_FILENAME_REGEX_DEFAULT)
+    Find the newest XLSX in the folder whose name contains whole word 'CP'.
+    Uses shared list_folder_files() and download_xlsx() from helper.py.
     """
-    STEP.step("Load configuration")
-    load_dotenv(override=False)
-
-    mongo_uri = os.getenv("MONGODB_URI")
-    mongo_db = os.getenv("MONGODB_DB")
-    creds_b64 = os.getenv("GOOGLE_CREDENTIALS_BASE64")
-
-    # Prefer dedicated CB folder id, fallback to the global one (same as ds.py)
-    folder_id = os.getenv("CB_GOOGLE_DRIVE_FOLDER_ID") or os.getenv("GOOGLE_DRIVE_FOLDER_ID")
-
-    if not (mongo_uri and mongo_db and creds_b64 and folder_id):
-        raise ConfigError(
-            "Missing one of: MONGODB_URI, MONGODB_DB, GOOGLE_CREDENTIALS_BASE64, "
-            "CB_GOOGLE_DRIVE_FOLDER_ID/GOOGLE_DRIVE_FOLDER_ID"
-        )
-
-    cb_regex = os.getenv("CB_FILENAME_REGEX", CB_FILENAME_REGEX_DEFAULT)
-    log(f"Using CB regex: {cb_regex}")
-
-    return Config(
-        mongo_uri=mongo_uri,
-        mongo_db=mongo_db,
-        creds_b64=creds_b64,
-        drive_folder_id=folder_id,
-        cb_regex=cb_regex,
-    )
-
-# ---------------------------------------------------------------------------
-# DRIVE PICKER
-# ---------------------------------------------------------------------------
-
-def pick_and_fetch_cb(drive, folder_id: str, name_regex: str):
-    """
-    Find latest CB XLSX in folder matching regex + XLSX MIME, then download
-    it to data/cb.xlsx using shared Drive helpers.
-    """
-    STEP.step("Find valid XLSX for cb.xlsx")
-    rx = re.compile(name_regex)
+    rx = re.compile(r"(?i)\bCP\b")
     files = list_folder_files(drive, folder_id)
     if not files:
-        raise DriveError("CB folder is empty")
+        raise DriveError("CP: Drive folder is empty")
 
-    for f in files:  # newest first (list_folder_files already sorts desc)
+    for f in files:  # already sorted newest-first by modifiedTime
         fid = f.get("id")
         name = f.get("name", "")
         mime = f.get("mimeType", "")
-
         if not (rx.search(name) and _looks_like_xlsx(name, mime)):
             continue
-
-        log(f"CB candidate: {name} (mime ok)")
-        tmp = "data/.tmp_cb.xlsx"
+        log(f"CP candidate: {name} ({f.get('modifiedTime')})")
+        tmp = "data/.tmp_cp.xlsx"
         download_xlsx(drive, fid, tmp)
-
-        final_path = "data/cb.xlsx"
+        final_path = "data/cp.xlsx"
         try:
             if os.path.exists(final_path):
                 os.remove(final_path)
         except Exception:
             pass
         os.replace(tmp, final_path)
-        log(f"CB accepted: {name}")
-        return fid, name, final_path
+        log(f"CP accepted: {name}")
+        return final_path
 
-    raise DriveError("No XLSX matched regex + MIME + extension for CB.")
+    raise DriveError("No matching CP XLSX found in Drive folder")
 
-# ---------------------------------------------------------------------------
-# EXCEL READER (STRICT HEADERS)
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Reading and normalization
+# ─────────────────────────────────────────────────────────────────────────────
 
-def read_cb_strict(path: str, header_row: int, header_map: Dict[str, str]) -> pd.DataFrame:
+def read_strict(path: str, header_row: int, header_map: dict, label: str) -> pd.DataFrame:
     """
-    Strict CB reader:
-      - read Excel with header_row
-      - clean XML escapes
-      - normalize labels (lowercase, no accents, etc.) via _norm_label
-      - keep+rename only expected columns (CB_HEADERS_MAP)
-      - error if nothing matched
+    Read Excel with strict header verification:
+      • decode Excel escapes
+      • normalize labels
+      • keep+rename only expected columns
     """
-    STEP.step("Read CB (keep+rename, STRICT headers)")
+    log(f"Read {label} from {path}")
     df = pd.read_excel(path, header=header_row, engine="openpyxl")
-
-    # Clean encoded control characters in values
     df = _clean_dataframe_excel_escapes(df)
 
-    # Expected: normalized label -> canonical field name
-    norm_expected_to_canonical: Dict[str, str] = {
-        _norm_label(lbl): canonical
-        for lbl, canonical in header_map.items()
-    }
+    norm_expected = {_norm_label(k): (k, v) for k, v in header_map.items()}
+    norm_actual = {_norm_label(c): c for c in df.columns}
 
-    # Actual: normalized label -> original column name
-    norm_label_to_actual: Dict[str, str] = {}
-    for col in df.columns:
-        norm_label_to_actual[_norm_label(col)] = col
-
-    matched: Dict[str, str] = {}
-    for nlabel, canonical in norm_expected_to_canonical.items():
-        if nlabel in norm_label_to_actual:
-            actual = norm_label_to_actual[nlabel]
-            matched[canonical] = actual
-            log(f"CB: matched '{canonical}' <- '{actual}' (strict)")
+    matched = {}
+    for ne, (orig_label, canon) in norm_expected.items():
+        if ne in norm_actual:
+            matched[canon] = norm_actual[ne]
 
     if not matched:
-        raise TransformError(
-            f"CB: none of the expected headers found (strict normalized match) at row {header_row + 1}"
-        )
+        raise TransformError(f"{label}: expected headers not found (check header_row={header_row})")
 
-    keep_cols = [matched[c] for c in matched]
-    rename_map = {matched[c]: c for c in matched}
-
-    out = df[keep_cols].rename(columns=rename_map).copy()
-    log(f"CB: kept columns -> {list(out.columns)}")
-    return out
-
-# ---------------------------------------------------------------------------
-# NORMALISATION
-# ---------------------------------------------------------------------------
-
-def normalize_cb_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normalize CB fields:
-      - date_cb -> ISO string
-      - imm -> imm_norm (canon_plate)
-      - numeric columns -> numbers (float) where possible
-      - filter rows without imm_norm (no vehicle)
-    """
-    STEP.step("Normalize CB rows")
-
-    if "date_cb" in df.columns:
-        df["date_cb"] = df["date_cb"].map(_iso_date_from_any)
-
-    if "imm" in df.columns:
-        df["imm_norm"] = df["imm"].map(canon_plate)
-
-    # Numeric-like columns
-    for col in ("unit_price_cb", "qty_cb", "amount_ht_cb", "total_ht_cb", "km_cb"):
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # Require imm_norm to identify a vehicle
-    if "imm_norm" in df.columns:
-        df = df[df["imm_norm"].map(lambda v: bool(_txt(v)))].copy()
-
-    if df.empty:
-        log("CB: no valid rows after imm_norm filter")
-
+    df = df[list(matched.values())].rename(columns={v: k for k, v in matched.items()})
+    log(f"{label}: kept -> {list(df.columns)}")
     return df
 
-# ---------------------------------------------------------------------------
-# BUILD DOCUMENTS
-# ---------------------------------------------------------------------------
 
-def build_cb_docs(df_raw: pd.DataFrame) -> List[Dict[str, Any]]:
+def process_cp(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Build one Mongo document per CB row.
-
-    - Uses ONLY the 20 logical CB_LINE_FIELDS for the payload/signature.
-    - Adds imm_norm as an extra technical field (derived from Immatriculation).
-    - _id/doc_sig = sha256(JSON of CB_LINE_FIELDS rendered as strings).
+    Normalize and deduplicate CP rows:
+      • imm_norm / vin_norm / ww_norm
+      • date_debut_cp / date_fin_cp (ISO)
+      • keep latest date_fin_cp per imm_norm
     """
-    STEP.step("Build CB documents")
+    df = df.copy()
 
-    df = normalize_cb_df(df_raw.copy())
-    if df.empty:
-        return []
+    df["imm_norm"] = df["imm"].map(canon_plate)
+    df["vin_norm"] = df["vin"].map(canon_vin)
+    df["ww_norm"]  = df["ww"].map(canon_plate)
 
-    docs: List[Dict[str, Any]] = []
+    df["date_debut_cp"] = df["date_debut_cp"].map(_iso_date_from_any)
+    df["date_fin_cp"]   = df["date_fin_cp"].map(_iso_date_from_any)
 
-    for _, row in df.iterrows():
-        payload = {
-            k: _txt(row.get(k)) if k in df.columns else None
-            for k in CB_LINE_FIELDS
-        }
-        doc_sig = _sha256_json(payload)
+    df["_sort_date"] = pd.to_datetime(df["date_fin_cp"], errors="coerce")
+    df = df.sort_values(by="_sort_date", ascending=False, na_position="last").drop(columns="_sort_date")
 
-        doc = {
-            "_id": doc_sig,
-            "doc_sig": doc_sig,
-            **payload,
-        }
+    total_rows = len(df)
+    df_unique = df.drop_duplicates(subset=["imm_norm"], keep="first")
+    dropped = total_rows - len(df_unique)
+    log(f"CP stats: total_rows={total_rows} kept={len(df_unique)} dropped={dropped}")
 
-        # extra technical field for queries (not part of 20 headers)
-        if "imm_norm" in df.columns:
-            doc["imm_norm"] = _txt(row.get("imm_norm"))
+    return df_unique
 
-        docs.append(doc)
 
-    log(f"CB docs: {len(docs)}")
+def build_cp_docs(df: pd.DataFrame) -> list[dict]:
+    """
+    Convert CP dataframe rows into MongoDB documents with doc_sig.
+    """
+    docs: list[dict] = []
+
+    for _, r in df.iterrows():
+        rec = {k: (None if pd.isna(v) else v) for k, v in r.to_dict().items()}
+
+        _id = rec.get("imm_norm") or rec.get("vin_norm") or rec.get("ww_norm")
+        if not _id:
+            continue
+
+        rec["_id"] = _id
+
+        rec["doc_sig"] = _sha256_json({
+            "imm_norm": rec.get("imm_norm"),
+            "vin_norm": rec.get("vin_norm"),
+            "ww_norm":  rec.get("ww_norm"),
+            "imm":      rec.get("imm"),
+            "vin":      rec.get("vin"),
+            "ww":       rec.get("ww"),
+            "client":   rec.get("client"),
+            "modele_long":   rec.get("modele_long"),
+            "date_debut_cp": rec.get("date_debut_cp"),
+            "date_fin_cp":   rec.get("date_fin_cp"),
+        })
+
+        rec = {k: v for k, v in rec.items() if v is not None}
+        docs.append(rec)
+
+    log(f"CP docs built: {len(docs)}")
     return docs
 
-# ---------------------------------------------------------------------------
-# MONGO HELPERS
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# MongoDB plumbing
+# ─────────────────────────────────────────────────────────────────────────────
 
-def get_client_db(uri: str, dbname: str):
-    STEP.step("Connect to MongoDB")
-    try:
-        client = MongoClient(
-            uri,
-            serverSelectionTimeoutMS=20000,
-            socketTimeoutMS=300000,
-            connectTimeoutMS=20000,
-            maxPoolSize=100,
-            compressors=["zstd", "snappy", "zlib"],
-            retryWrites=True,
-            appname="etl-upsert-cb",
-        )
-        db = client.get_database(dbname, write_concern=WriteConcern(w=1))
-        client.admin.command("ping")
-        log("Mongo ping OK")
-        return client, db
-    except Exception as e:
-        raise UpsertError(f"Mongo connection failed: {e}")
+def get_db(uri: str, dbname: str):
+    """Connect to MongoDB with ping & simple write concern."""
+    client = MongoClient(
+        uri,
+        serverSelectionTimeoutMS=20000,
+        compressors=["zstd", "snappy", "zlib"],
+    )
+    client.admin.command("ping")
+    db = client.get_database(dbname, write_concern=WriteConcern(w=1))
+    return client, db
 
 
-def ensure_cb_indexes(db) -> None:
-    STEP.step("Ensure cb indexes")
-    try:
-        for field in ("imm_norm", "num_bc", "date_cb", "doc_sig", "supplier_cb", "city_cb"):
-            db.cb.create_index(field)
-        log("cb indexes ensured")
-    except Exception as e:
-        raise UpsertError(f"Creating cb indexes failed: {e}")
+def ensure_indexes_cp(db) -> None:
+    """
+    Create basic indexes for CP lookup & signature checks.
+    """
+    db.cp.create_index([("imm_norm", ASCENDING)], name="imm_norm", sparse=True)
+    db.cp.create_index([("vin_norm", ASCENDING)], name="vin_norm", sparse=True)
+    db.cp.create_index([("ww_norm",  ASCENDING)], name="ww_norm",  sparse=True)
+    db.cp.create_index([("doc_sig",  ASCENDING)], name="doc_sig")
+    db.cp.create_index([("date_fin_cp", ASCENDING)], name="date_fin_cp", sparse=True)
 
 
-def _preload_sig_cb(db, ids: List[str]) -> Dict[str, Optional[str]]:
-    if not ids:
-        return {}
-    cur = db.cb.find({"_id": {"$in": ids}}, {"_id": 1, "doc_sig": 1})
-    return {str(d["_id"]): d.get("doc_sig") for d in cur}
-
-
-def upsert_cb(db, docs: List[Dict[str, Any]]) -> Dict[str, int]:
-    STEP.step("Upsert cb")
-
+def upsert_with_sig(db, coll: str, docs: list[dict], sig_field: str, dry_run: bool = False) -> None:
+    """
+    Upsert documents only if their signature changed.
+    """
     if not docs:
-        log("No CB docs to upsert")
-        return {"inserted": 0, "updated": 0, "skipped": 0}
+        log(f"{coll} → inserted=0 updated=0 skipped=0 (no docs)")
+        return
 
-    sig_map = _preload_sig_cb(db, [d["_id"] for d in docs])
+    ids = [d["_id"] for d in docs]
+    existing = {
+        x["_id"]: x.get(sig_field)
+        for x in db[coll].find({"_id": {"$in": ids}}, {"_id": 1, sig_field: 1})
+    }
+
     now = datetime.now(TZ.utc)
-
-    inserted = updated = skipped = 0
-    ops: List[UpdateOne] = []
+    ins = upd = skp = 0
+    ops: list[UpdateOne] = []
 
     for d in docs:
-        prev_sig = sig_map.get(d["_id"], None)
-        if prev_sig is None:
-            inserted += 1
-        elif prev_sig == d.get("doc_sig"):
-            skipped += 1
+        prev = existing.get(d["_id"])
+        cur = d.get(sig_field)
+        if prev == cur:
+            skp += 1
             continue
+
+        if prev is None:
+            ins += 1
         else:
-            updated += 1
+            upd += 1
 
-        ops.append(
-            UpdateOne(
-                {"_id": d["_id"]},
-                {
-                    "$set": {**d, "updated_at": now},
-                    "$setOnInsert": {"created_at": now},
-                },
-                upsert=True,
-            )
-        )
+        payload = {**d, "updated_at": now}
+        payload.setdefault("created_at", now)
 
-    if ops:
-        db.cb.bulk_write(ops, ordered=False, bypass_document_validation=True)
+        ops.append(UpdateOne({"_id": d["_id"]}, {"$set": payload}, upsert=True))
 
-    log(f"cb → inserted={inserted} updated={updated} skipped={skipped}")
-    return {"inserted": inserted, "updated": updated, "skipped": skipped}
+    if dry_run:
+        log(f"{coll} (dry-run) → would insert={ins} update={upd} skip={skp}")
+        return
 
-# ---------------------------------------------------------------------------
-# ORCHESTRATION
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class RunCfg:
-    mongo_uri: str
-    mongo_db: str
-    creds_b64: str
-    drive_folder_id: str
-    cb_regex: str
-
-
-def run(cfg: RunCfg) -> None:
-    log("BEGIN CB load")
-
-    drive = make_drive(cfg.creds_b64)
-    _, cb_name, cb_path = pick_and_fetch_cb(drive, cfg.drive_folder_id, cfg.cb_regex)
-    log(f"CB   → {cb_name}")
-
-    df_cb = read_cb_strict(cb_path, CB_HEADER_ROW, CB_HEADERS_MAP)
-    cb_docs = build_cb_docs(df_cb)
-
-    client, db = get_client_db(cfg.mongo_uri, cfg.mongo_db)
     try:
-        stats = upsert_cb(db, cb_docs)
-        ensure_cb_indexes(db)
+        if ops:
+            db[coll].bulk_write(ops, ordered=False)
+    except BulkWriteError as e:
+        log(f"Bulk write error: {e.details}")
+        raise
+
+    log(f"{coll} → inserted={ins} updated={upd} skipped={skp}")
+
+
+def drop_old_cp_duplicates(db) -> None:
+    """
+    Remove redundant old CP docs with same imm_norm, keeping the latest.
+    """
+    log("Clean old CP duplicates (keep latest per imm_norm)")
+
+    dup_keys = [
+        r["_id"]
+        for r in db.cp.aggregate([
+            {"$group": {"_id": "$imm_norm", "n": {"$sum": 1}}},
+            {"$match": {"n": {"$gt": 1}}},
+        ])
+        if r["_id"]
+    ]
+
+    removed = 0
+    for key in dup_keys:
+        rows = list(db.cp.find({"imm_norm": key}))
+        def sort_key(r):
+            d = pd.to_datetime(r.get("date_fin_cp"), errors="coerce")
+            return d if pd.notna(d) else pd.Timestamp.min
+        rows.sort(key=sort_key, reverse=True)
+        to_delete = [r["_id"] for r in rows[1:]]
+        if to_delete:
+            db.cp.delete_many({"_id": {"$in": to_delete}})
+            removed += len(to_delete)
+
+    log(f"Removed {removed} old CP duplicates")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run(cfg: dict, local_xlsx: str | None = None,
+        header_row: int = DEFAULT_CP_HEADER_ROW,
+        dry_run: bool = False) -> None:
+    """
+    End-to-end CP loader:
+      • fetch XLSX
+      • read & normalize
+      • build docs
+      • ensure indexes
+      • upsert with signature
+      • clean duplicates
+    """
+    # Basic env validation (Drive not required when using --local-xlsx)
+    for k in ("MONGODB_URI", "MONGODB_DB"):
+        if not cfg.get(k):
+            raise ConfigError(f"Missing required env: {k}")
+    if not local_xlsx:
+        for k in ("GOOGLE_CREDENTIALS_BASE64", "GOOGLE_DRIVE_FOLDER_ID"):
+            if not cfg.get(k):
+                raise ConfigError(f"Missing required env: {k}")
+
+    log("BEGIN CP load")
+
+    # 1) Acquire XLSX
+    if local_xlsx:
+        cp_path = local_xlsx
+        if not os.path.exists(cp_path):
+            raise FileNotFoundError(f"--local-xlsx not found: {cp_path}")
+        log(f"Using local XLSX: {cp_path}")
+    else:
+        drive = make_drive(cfg["GOOGLE_CREDENTIALS_BASE64"])
+        cp_path = pick_latest_cp(drive, cfg["GOOGLE_DRIVE_FOLDER_ID"])
+
+    # 2) Parse, normalize, deduplicate
+    df_cp = read_strict(cp_path, header_row, CP_HEADERS_MAP, "CP")
+    df_cp_unique = process_cp(df_cp)
+    cp_docs = build_cp_docs(df_cp_unique)
+
+    # 3) Mongo operations
+    client, db = get_db(cfg["MONGODB_URI"], cfg["MONGODB_DB"])
+    try:
+        ensure_indexes_cp(db)
+        drop_old_cp_duplicates(db)
+        upsert_with_sig(db, "cp", cp_docs, "doc_sig", dry_run=dry_run)
     finally:
-        try:
-            client.close()
-        except Exception:
-            pass
+        client.close()
 
-    log(f"UPSERT CB: {stats}")
-    log("END CB load")
+    log("END CP load")
 
-# ---------------------------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_args():
+    ap = argparse.ArgumentParser(description="CP loader")
+    ap.add_argument("--local-xlsx", help="Path to local CP.xlsx (bypass Drive)", default=None)
+    ap.add_argument("--header-row", type=int, default=DEFAULT_CP_HEADER_ROW)
+    ap.add_argument("--dry-run", action="store_true")
+    return ap.parse_args()
+
 
 if __name__ == "__main__":
-    if sys.getdefaultencoding().lower() != "utf-8":
-        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
-        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
+    # Allow UTF-8 logs everywhere
+    if not isinstance(getattr(__import__("sys"), "stdout"), io.TextIOBase):
+        import sys as _sys
+        _sys.stdout = io.TextIOWrapper(_sys.stdout.buffer, encoding="utf-8")
+        _sys.stderr = io.TextIOWrapper(_sys.stderr.buffer, encoding="utf-8")
 
-    try:
-        cfg = load_config()
-        run(
-            RunCfg(
-                cfg.mongo_uri,
-                cfg.mongo_db,
-                cfg.creds_b64,
-                cfg.drive_folder_id,
-                cfg.cb_regex,
-            )
-        )
-    except (ConfigError, DriveError, TransformError, UpsertError) as e:
-        log(f"ERROR: {e}")
-        sys.exit(2)
-    except Exception as e:
-        log(f"FATAL: {type(e).__name__}: {e}")
-        sys.exit(3)
+    load_dotenv()
+    args = parse_args()
+    cfg = {
+        "MONGODB_URI": os.getenv("MONGODB_URI"),
+        "MONGODB_DB": os.getenv("MONGODB_DB"),
+        "GOOGLE_CREDENTIALS_BASE64": os.getenv("GOOGLE_CREDENTIALS_BASE64"),
+        "GOOGLE_DRIVE_FOLDER_ID": os.getenv("GOOGLE_DRIVE_FOLDER_ID"),
+    }
+    run(cfg, local_xlsx=args.local_xlsx, header_row=args.header_row, dry_run=args.dry_run)
